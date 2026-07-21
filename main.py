@@ -1,4 +1,3 @@
-
 # ============================================
 # AUTOSERVICE BACKEND - FastAPI + PostgreSQL
 # ============================================
@@ -9,6 +8,7 @@ import os
 import random
 import hashlib
 import datetime
+import requests
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
@@ -330,6 +330,71 @@ def generate_otp() -> str:
     return str(random.randint(1000, 9999))
 
 # ============================================
+# SMS YUBORISH (ESKIZ.UZ)
+# ============================================
+# Ro'yxatdan o'ting: https://eskiz.uz -> akkaunt oching, "nickname" (jo'natuvchi nomi)
+# tasdiqlatib oling, so'ng quyidagi ENV o'zgaruvchilarini serveringizga qo'ying:
+#   ESKIZ_EMAIL, ESKIZ_PASSWORD, ESKIZ_SMS_FROM (masalan "4546" yoki tasdiqlangan nickname)
+ESKIZ_EMAIL = os.getenv("ESKIZ_EMAIL")
+ESKIZ_PASSWORD = os.getenv("ESKIZ_PASSWORD")
+ESKIZ_SMS_FROM = os.getenv("ESKIZ_SMS_FROM", "4546")  # 4546 - Eskiz test nickname
+ESKIZ_BASE_URL = "https://notify.eskiz.uz/api"
+
+_eskiz_token_cache = {"token": None, "expires_at": None}
+
+
+def _get_eskiz_token() -> str:
+    """Eskiz.uz uchun bearer token olish (kesh bilan, har safar login qilmaslik uchun)"""
+    now = datetime.datetime.utcnow()
+    if (
+        _eskiz_token_cache["token"]
+        and _eskiz_token_cache["expires_at"]
+        and now < _eskiz_token_cache["expires_at"]
+    ):
+        return _eskiz_token_cache["token"]
+
+    resp = requests.post(
+        f"{ESKIZ_BASE_URL}/auth/login",
+        data={"email": ESKIZ_EMAIL, "password": ESKIZ_PASSWORD},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    token = resp.json()["data"]["token"]
+
+    _eskiz_token_cache["token"] = token
+    _eskiz_token_cache["expires_at"] = now + datetime.timedelta(days=25)
+    return token
+
+
+def send_sms(phone: str, message: str) -> bool:
+    """
+    Haqiqiy SMS yuborish. ESKIZ_EMAIL/ESKIZ_PASSWORD sozlanmagan bo'lsa
+    (masalan local dev muhitida), faqat konsolga chiqaradi - demo rejim.
+    """
+    if not ESKIZ_EMAIL or not ESKIZ_PASSWORD:
+        print(f"[SMS DEMO REJIM] {phone} -> {message}")
+        return True
+
+    try:
+        token = _get_eskiz_token()
+        clean_phone = phone.replace("+", "")
+        resp = requests.post(
+            f"{ESKIZ_BASE_URL}/message/sms/send",
+            headers={"Authorization": f"Bearer {token}"},
+            data={
+                "mobile_phone": clean_phone,
+                "message": message,
+                "from": ESKIZ_SMS_FROM,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"SMS yuborishda xatolik: {e}")
+        return False
+
+# ============================================
 # FASTAPI APP
 # ============================================
 app = FastAPI(
@@ -351,11 +416,7 @@ app.add_middleware(
 # ============================================
 @app.post("/api/send-otp")
 def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
-    """Telefon raqamga OTP yuborish (demo: kodni qaytaradi)"""
-    # Check if user exists
-    user = db.query(User).filter(User.phone == request.phone).first()
-
-    # Generate OTP
+    """Telefon raqamga SMS orqali tasdiqlash kodi yuborish"""
     code = generate_otp()
     expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
 
@@ -364,14 +425,23 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
     db.add(otp)
     db.commit()
 
-    # TODO: Integrate real SMS gateway (Twilio, Eskiz, etc.)
-    # For demo, we return the code
-    return {
+    message = f"AutoService tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+    sent = send_sms(request.phone, message)
+
+    if not sent:
+        raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
+
+    response = {
         "success": True,
-        "message": "OTP yuborildi",
-        "demo_code": code,  # Remove in production!
+        "message": "SMS yuborildi",
         "expires_in": 300
     }
+
+    # Faqat production bo'lmagan muhitda kodni javobda ko'rsatamiz (test uchun qulay)
+    if os.getenv("APP_ENV") != "production":
+        response["demo_code"] = code
+
+    return response
 
 @app.post("/api/verify-otp")
 def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
@@ -394,6 +464,16 @@ def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
 @app.post("/api/register")
 def register(request: RegisterRequest, db: Session = Depends(get_db)):
     """Yangi foydalanuvchini ro'yxatdan o'tkazish"""
+    # Telefon raqam SMS orqali tasdiqlanganligini tekshirish
+    verified_otp = db.query(OTPCode).filter(
+        OTPCode.phone == request.phone,
+        OTPCode.is_used == True,
+        OTPCode.created_at > datetime.datetime.utcnow() - datetime.timedelta(minutes=30)
+    ).order_by(OTPCode.created_at.desc()).first()
+
+    if not verified_otp:
+        raise HTTPException(status_code=400, detail="Avval telefon raqamni SMS kodi orqali tasdiqlang")
+
     # Check if phone already exists
     existing = db.query(User).filter(User.phone == request.phone).first()
     if existing:
