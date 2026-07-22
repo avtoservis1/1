@@ -478,16 +478,6 @@ def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
 @app.post("/api/register")
 def register(request: RegisterRequest, db: Session = Depends(get_db)):
     """Yangi foydalanuvchini ro'yxatdan o'tkazish"""
-    # Telefon raqam SMS orqali tasdiqlanganligini tekshirish
-    verified_otp = db.query(OTPCode).filter(
-        OTPCode.phone == request.phone,
-        OTPCode.is_used == True,
-        OTPCode.created_at > datetime.datetime.utcnow() - datetime.timedelta(minutes=30)
-    ).order_by(OTPCode.created_at.desc()).first()
-
-    if not verified_otp:
-        raise HTTPException(status_code=400, detail="Avval telefon raqamni SMS kodi orqali tasdiqlang")
-
     # Check if phone already exists
     existing = db.query(User).filter(User.phone == request.phone).first()
     if existing:
