@@ -446,6 +446,20 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
 @app.post("/api/verify-otp")
 def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
     """OTP kodni tasdiqlash"""
+
+    # VAQTINCHALIK MASTER-KOD (TEST UCHUN): "1234" har doim qabul qilinadi.
+    # PRODUCTIONGA CHIQISHDAN OLDIN BU BLOKNI O'CHIRIB TASHLANG!
+    if request.code == "1234":
+        otp = OTPCode(
+            phone=request.phone,
+            code=request.code,
+            expires_at=datetime.datetime.utcnow() + datetime.timedelta(minutes=5),
+            is_used=True,
+        )
+        db.add(otp)
+        db.commit()
+        return {"success": True, "message": "Kod tasdiqlandi"}
+
     otp = db.query(OTPCode).filter(
         OTPCode.phone == request.phone,
         OTPCode.code == request.code,
