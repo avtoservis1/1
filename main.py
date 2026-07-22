@@ -73,6 +73,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String(20), unique=True, index=True, nullable=False)
     name = Column(String(100), nullable=False)
+    city = Column(String(100), nullable=True)
     password_hash = Column(String(256), nullable=False)
     role = Column(String(20), default=UserRole.USER.value)
     avatar_url = Column(String(500), nullable=True)
@@ -95,6 +96,7 @@ class Car(Base):
     plate_number = Column(String(20), nullable=True)
     year = Column(Integer, nullable=True)
     color = Column(String(50), nullable=True)
+    fuel_type = Column(String(20), nullable=True)
     is_primary = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -232,8 +234,12 @@ class RegisterRequest(BaseModel):
     phone: str
     name: str
     password: str = Field(..., min_length=6)
+    city: Optional[str] = None
     car_model: Optional[str] = None
     plate_number: Optional[str] = None
+    year: Optional[int] = None
+    color: Optional[str] = None
+    fuel_type: Optional[str] = None
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -262,6 +268,7 @@ class CarCreate(BaseModel):
     plate_number: Optional[str] = None
     year: Optional[int] = None
     color: Optional[str] = None
+    fuel_type: Optional[str] = None
     is_primary: bool = False
 
 class ServiceCreate(BaseModel):
@@ -488,6 +495,7 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
     user = User(
         phone=request.phone,
         name=request.name,
+        city=request.city,
         password_hash=password_hash,
         role=UserRole.USER.value,
         is_active=True
@@ -502,6 +510,9 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
             user_id=user.id,
             model=request.car_model,
             plate_number=request.plate_number,
+            year=request.year,
+            color=request.color,
+            fuel_type=request.fuel_type,
             is_primary=True
         )
         db.add(car)
@@ -581,6 +592,7 @@ def add_car(user_id: int, car: CarCreate, db: Session = Depends(get_db)):
         plate_number=car.plate_number,
         year=car.year,
         color=car.color,
+        fuel_type=car.fuel_type,
         is_primary=car.is_primary
     )
     db.add(new_car)
@@ -994,4 +1006,4 @@ def health_check():
 # ============================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
