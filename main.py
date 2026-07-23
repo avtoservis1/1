@@ -220,6 +220,45 @@ class OTPCode(Base):
 Base.metadata.create_all(bind=engine)
 
 # ============================================
+# LIGHTWEIGHT AUTO-MIGRATION
+# ============================================
+# Base.metadata.create_all() only creates tables that don't exist yet — it
+# never adds new columns to a table that already exists in the database.
+# So whenever a Column is added to a model above, the live Postgres table
+# on Railway falls out of sync and queries fail with UndefinedColumn.
+#
+# This scans every model's columns against the real database schema and
+# ALTER TABLE ... ADD COLUMN's anything that's missing, so a code deploy
+# alone keeps the schema in sync. This is a pragmatic stopgap, not a
+# replacement for a real migration tool (Alembic) — it can't rename/drop
+# columns, change types, or safely backfill a NOT NULL column with no
+# default on a table that already has rows (those are always added as
+# nullable here so the ALTER doesn't fail).
+def sync_missing_columns():
+    import logging
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue  # brand-new table: create_all already built it in full
+            existing_cols = {col["name"] for col in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing_cols:
+                    continue
+                col_type = column.type.compile(dialect=engine.dialect)
+                ddl = f'ALTER TABLE "{table.name}" ADD COLUMN IF NOT EXISTS "{column.name}" {col_type}'
+                conn.execute(text(ddl))
+                logging.getLogger("uvicorn.error").warning(
+                    f"[auto-migration] added missing column {table.name}.{column.name} ({col_type})"
+                )
+
+sync_missing_columns()
+
+# ============================================
 # PYDANTIC SCHEMAS
 # ============================================
 class PhoneRequest(BaseModel):
