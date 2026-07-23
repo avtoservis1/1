@@ -116,10 +116,14 @@ class Service(Base):
     logo_url = Column(String(500), nullable=True)
     images = Column(Text, nullable=True)  # JSON array of image URLs
     working_hours = Column(String(100), nullable=True)  # e.g., "09:00-18:00"
+    day_off = Column(String(50), nullable=True)  # e.g., "Yakshanba"
     rating = Column(Float, default=0.0)
     review_count = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
+    # Admin moderation workflow: pending -> approved / rejected
+    status = Column(String(20), default="pending")
+    reject_reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -280,6 +284,37 @@ class ServiceCreate(BaseModel):
     longitude: float
     working_hours: Optional[str] = None
     categories: List[str] = []
+
+class ServiceOwnerRegisterRequest(BaseModel):
+    phone: str
+    first_name: str
+    last_name: str
+    service_name: str
+    address: str
+    latitude: float
+    longitude: float
+    day_off: Optional[str] = None
+    logo_base64: Optional[str] = None  # data-URL or raw base64 of the logo image
+
+    @validator('phone')
+    def validate_phone(cls, v):
+        v = v.replace(' ', '').replace('-', '')
+        if not v.startswith('+'):
+            raise ValueError('Telefon raqam + bilan boshlanishi kerak')
+        return v
+
+class ServiceEditRequest(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    day_off: Optional[str] = None
+    working_hours: Optional[str] = None
+    logo_base64: Optional[str] = None
+
+class ServiceRejectRequest(BaseModel):
+    reason: Optional[str] = None
 
 class ServiceResponse(BaseModel):
     id: int
@@ -529,6 +564,73 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
         "name": user.name,
         "phone": user.phone,
         "role": user.role
+    }
+
+@app.post("/api/service-owner/register")
+def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = Depends(get_db)):
+    """Servis egasini ro'yxatdan o'tkazish (telefon OTP orqali oldindan tasdiqlangan bo'lishi kerak).
+    Yaratilgan servis 'pending' holatida bo'ladi va admin tasdig'ini kutadi."""
+
+    user = db.query(User).filter(User.phone == request.phone).first()
+    full_name = f"{request.first_name} {request.last_name}".strip()
+
+    if not user:
+        password_hash = hash_password(f"otp-{request.phone.replace('+', '')}")
+        user = User(
+            phone=request.phone,
+            name=full_name,
+            password_hash=password_hash,
+            role=UserRole.SERVICE_OWNER.value,
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        user.name = full_name
+        user.role = UserRole.SERVICE_OWNER.value
+        db.commit()
+
+    service = Service(
+        owner_id=user.id,
+        name=request.service_name,
+        phone=request.phone,
+        address=request.address,
+        latitude=request.latitude,
+        longitude=request.longitude,
+        day_off=request.day_off,
+        logo_url=request.logo_base64,
+        is_active=False,   # admin tasdiqlamaguncha ro'yxatda ko'rinmaydi
+        is_verified=False,
+        status="pending",
+    )
+    db.add(service)
+    db.commit()
+    db.refresh(service)
+
+    token = generate_token(user.id)
+
+    return {
+        "success": True,
+        "message": "Arizangiz qabul qilindi. Admin tasdiqlashini kuting.",
+        "token": token,
+        "user_id": user.id,
+        "service_id": service.id,
+        "status": service.status,
+    }
+
+@app.get("/api/service-owner/status")
+def service_owner_status(service_id: int, db: Session = Depends(get_db)):
+    """Servis egasi o'z arizasi holatini tekshirishi uchun (pending/approved/rejected)."""
+    service = db.query(Service).filter(Service.id == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+    return {
+        "id": service.id,
+        "status": service.status,
+        "is_verified": service.is_verified,
+        "is_active": service.is_active,
+        "reject_reason": service.reject_reason,
     }
 
 @app.post("/api/login")
@@ -956,16 +1058,29 @@ def admin_get_orders(status: Optional[str] = None, db: Session = Depends(get_db)
     ]
 
 @app.get("/api/admin/services")
-def admin_get_services(db: Session = Depends(get_db)):
-    services = db.query(Service).all()
+def admin_get_services(status: Optional[str] = None, db: Session = Depends(get_db)):
+    """status: 'pending' | 'approved' | 'rejected' | None (hammasi)"""
+    query = db.query(Service)
+    if status:
+        query = query.filter(Service.status == status)
+    services = query.order_by(Service.created_at.desc()).all()
     return [
         {
             "id": s.id,
             "name": s.name,
+            "owner_id": s.owner_id,
             "owner_name": s.owner.name,
             "phone": s.phone,
+            "address": s.address,
+            "latitude": s.latitude,
+            "longitude": s.longitude,
+            "logo_url": s.logo_url,
+            "day_off": s.day_off,
+            "working_hours": s.working_hours,
             "is_active": s.is_active,
             "is_verified": s.is_verified,
+            "status": s.status,
+            "reject_reason": s.reject_reason,
             "rating": s.rating,
             "created_at": s.created_at
         }
@@ -974,12 +1089,57 @@ def admin_get_services(db: Session = Depends(get_db)):
 
 @app.put("/api/admin/services/{service_id}/verify")
 def admin_verify_service(service_id: int, db: Session = Depends(get_db)):
+    """✅ Tasdiqlash — servisni tasdiqlaydi va faollashtiradi."""
     service = db.query(Service).filter(Service.id == service_id).first()
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
     service.is_verified = True
+    service.is_active = True
+    service.status = "approved"
+    service.reject_reason = None
     db.commit()
-    return {"id": service.id, "is_verified": True}
+    return {"id": service.id, "is_verified": True, "is_active": True, "status": service.status}
+
+@app.put("/api/admin/services/{service_id}/reject")
+def admin_reject_service(service_id: int, request: ServiceRejectRequest, db: Session = Depends(get_db)):
+    """❌ Rad etish — arizani rad etadi (sababi bilan)."""
+    service = db.query(Service).filter(Service.id == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+    service.is_verified = False
+    service.is_active = False
+    service.status = "rejected"
+    service.reject_reason = request.reason
+    db.commit()
+    return {"id": service.id, "status": service.status, "reject_reason": service.reject_reason}
+
+@app.put("/api/admin/services/{service_id}/edit")
+def admin_edit_service(service_id: int, request: ServiceEditRequest, db: Session = Depends(get_db)):
+    """✏️ Tahrirlash — admin servis ma'lumotlarini tahrirlashi mumkin."""
+    service = db.query(Service).filter(Service.id == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    if request.name is not None:
+        service.name = request.name
+    if request.phone is not None:
+        service.phone = request.phone
+    if request.address is not None:
+        service.address = request.address
+    if request.latitude is not None:
+        service.latitude = request.latitude
+    if request.longitude is not None:
+        service.longitude = request.longitude
+    if request.day_off is not None:
+        service.day_off = request.day_off
+    if request.working_hours is not None:
+        service.working_hours = request.working_hours
+    if request.logo_base64 is not None:
+        service.logo_url = request.logo_base64
+
+    db.commit()
+    db.refresh(service)
+    return {"id": service.id, "message": "Servis ma'lumotlari yangilandi"}
 
 @app.put("/api/admin/services/{service_id}/block")
 def admin_block_service(service_id: int, db: Session = Depends(get_db)):
@@ -1006,4 +1166,4 @@ def health_check():
 # ============================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)
