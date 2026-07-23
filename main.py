@@ -27,6 +27,8 @@ import enum
 DATABASE_URL = os.getenv(
     "DATABASE_URL"
 )
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set. Set it in Railway's Variables tab.")
 
 # Fix for SQLAlchemy asyncpg compatibility
 if DATABASE_URL.startswith("postgres://"):
@@ -452,6 +454,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Catch-all handler for unhandled exceptions. Without this, an uncaught
+# error (DB issue, bad env var, bug in a handler, etc.) propagates past
+# CORSMiddleware and Starlette's default error response never gets CORS
+# headers attached — the browser then reports a confusing "CORS blocked"
+# error instead of the real 500. This also prints the full traceback to
+# the server logs (visible in `railway logs`) so the actual cause is easy
+# to find instead of guessing from the frontend.
+import logging
+import traceback
+from fastapi.responses import JSONResponse
+
+logger = logging.getLogger("uvicorn.error")
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    logger.error("Unhandled exception on %s %s:\n%s", request.method, request.url.path, traceback.format_exc())
+    return JSONResponse(status_code=500, content={"detail": "Server xatosi. Birozdan so'ng qayta urinib ko'ring."})
 
 # ============================================
 # AUTH ENDPOINTS
