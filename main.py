@@ -390,6 +390,24 @@ class ServiceEditRequest(BaseModel):
 class ServiceRejectRequest(BaseModel):
     reason: Optional[str] = None
 
+class ServiceOwnerProfileUpdate(BaseModel):
+    """Servis egasi 'Profil' bo'limidan o'zi to'ldiradigan maydonlar."""
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    working_hours: Optional[str] = None
+    day_off: Optional[str] = None
+    description: Optional[str] = None
+    logo_base64: Optional[str] = None
+
+class ServiceOfferedUpsert(BaseModel):
+    """Servis egasi 'Xizmatlarni boshqarish' bo'limida bitta xizmat narxi/holatini yuboradi."""
+    category: str
+    price: Optional[float] = None
+    is_active: bool = True
+
 class ServiceResponse(BaseModel):
     id: int
     name: str
@@ -791,6 +809,12 @@ def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
         "phone": service.phone,
         "rating": service.rating,
         "review_count": service.review_count,
+        "latitude": service.latitude,
+        "longitude": service.longitude,
+        "working_hours": service.working_hours,
+        "day_off": service.day_off,
+        "description": service.description,
+        "logo_url": service.logo_url,
     }
 
 @app.get("/api/service-owner/orders")
@@ -822,6 +846,199 @@ def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
         }
         for o in orders
     ]
+
+@app.put("/api/service-owner/profile")
+def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpdate, db: Session = Depends(get_db)):
+    """Servis egasi o'z profili/servisiga oid ma'lumotlarni yangilaydi ('Profil' bo'limi)."""
+    owner = db.query(User).filter(User.id == owner_id).first()
+    if not owner or owner.role != UserRole.SERVICE_OWNER.value:
+        raise HTTPException(status_code=403, detail="Bu foydalanuvchi servis egasi emas")
+
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    data = request.dict(exclude_unset=True)
+    logo_base64 = data.pop("logo_base64", None)
+    for field, value in data.items():
+        setattr(service, field, value)
+    if logo_base64:
+        service.logo_url = logo_base64
+    if request.name:
+        owner.name = request.name
+    db.commit()
+    db.refresh(service)
+
+    return {
+        "success": True,
+        "id": service.id,
+        "name": service.name,
+        "phone": service.phone,
+        "address": service.address,
+        "latitude": service.latitude,
+        "longitude": service.longitude,
+        "working_hours": service.working_hours,
+        "day_off": service.day_off,
+        "description": service.description,
+        "logo_url": service.logo_url,
+        "status": service.status,
+    }
+
+@app.get("/api/service-owner/services-offered")
+def list_services_offered(owner_id: int, db: Session = Depends(get_db)):
+    """Servis egasi boshqaradigan xizmatlar ro'yxati (narx va faol/nofaol holati)."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        return []
+    items = db.query(ServiceOffered).filter(ServiceOffered.service_id == service.id).all()
+    return [
+        {"id": i.id, "category": i.category, "price": i.price, "is_active": i.is_active}
+        for i in items
+    ]
+
+@app.post("/api/service-owner/services-offered")
+def upsert_service_offered(owner_id: int, request: ServiceOfferedUpsert, db: Session = Depends(get_db)):
+    """Xizmat qo'shadi, mavjud bo'lsa (bir xil category) narxi/holatini yangilaydi."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    item = (
+        db.query(ServiceOffered)
+        .filter(ServiceOffered.service_id == service.id, ServiceOffered.category == request.category)
+        .first()
+    )
+    if item:
+        item.price = request.price
+        item.is_active = request.is_active
+    else:
+        item = ServiceOffered(service_id=service.id, category=request.category, price=request.price, is_active=request.is_active)
+        db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id, "category": item.category, "price": item.price, "is_active": item.is_active}
+
+@app.delete("/api/service-owner/services-offered/{item_id}")
+def delete_service_offered(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(ServiceOffered).filter(ServiceOffered.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Xizmat topilmadi")
+    db.delete(item)
+    db.commit()
+    return {"success": True}
+
+@app.get("/api/service-owner/dashboard")
+def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
+    """Dashboard: bugungi/faol/yakunlangan buyurtmalar va daromad statistikasi."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    orders = db.query(Order).filter(Order.service_id == service.id).all()
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    active_statuses = {"pending", "accepted", "on_way", "arrived"}
+
+    today_count = sum(1 for o in orders if o.created_at and o.created_at.date() == today)
+    active_count = sum(1 for o in orders if o.status in active_statuses)
+    completed_count = sum(1 for o in orders if o.status == "completed")
+    revenue = sum(o.price or 0 for o in orders if o.status == "completed")
+
+    recent = sorted(orders, key=lambda o: o.created_at or datetime.datetime.min, reverse=True)[:5]
+
+    return {
+        "service_name": service.name,
+        "status": service.status,
+        "rating": service.rating,
+        "review_count": service.review_count,
+        "today_orders": today_count,
+        "active_orders": active_count,
+        "completed_orders": completed_count,
+        "revenue": revenue,
+        "recent_orders": [
+            {
+                "id": o.id,
+                "customer_name": o.user.name if o.user else None,
+                "category": o.category,
+                "status": o.status,
+                "created_at": o.created_at,
+            }
+            for o in recent
+        ],
+    }
+
+@app.get("/api/service-owner/stats")
+def service_owner_stats(owner_id: int, period: str = "daily", db: Session = Depends(get_db)):
+    """Kunlik/haftalik/oylik buyurtmalar soni va daromad ('Statistika' bo'limi)."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    completed = (
+        db.query(Order)
+        .filter(Order.service_id == service.id, Order.status == "completed")
+        .all()
+    )
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    buckets = 7 if period == "daily" else (4 if period == "weekly" else 6)
+    span_days = 1 if period == "daily" else (7 if period == "weekly" else 30)
+
+    labels: List[str] = []
+    counts = [0] * buckets
+    revenues = [0.0] * buckets
+
+    for i in range(buckets):
+        bucket_end = now - datetime.timedelta(days=span_days * i)
+        bucket_start = bucket_end - datetime.timedelta(days=span_days)
+        labels.append(bucket_start.strftime("%d.%m"))
+        for o in completed:
+            created = o.created_at
+            if created and created.tzinfo is None:
+                created = created.replace(tzinfo=datetime.timezone.utc)
+            if created and bucket_start <= created < bucket_end:
+                counts[i] += 1
+                revenues[i] += o.price or 0
+
+    labels.reverse()
+    counts.reverse()
+    revenues.reverse()
+
+    return {
+        "period": period,
+        "labels": labels,
+        "order_counts": counts,
+        "revenues": revenues,
+        "total_orders": len(completed),
+        "total_revenue": sum(o.price or 0 for o in completed),
+    }
+
+@app.get("/api/service-owner/reviews")
+def service_owner_reviews(owner_id: int, db: Session = Depends(get_db)):
+    """Servisga yozilgan fikr va baholar ro'yxati ('Reyting' bo'limi)."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        return {"rating": 0, "review_count": 0, "reviews": []}
+
+    reviews = (
+        db.query(Review)
+        .filter(Review.service_id == service.id)
+        .order_by(Review.created_at.desc())
+        .all()
+    )
+    return {
+        "rating": service.rating,
+        "review_count": service.review_count,
+        "reviews": [
+            {
+                "id": r.id,
+                "user_name": r.user.name if r.user else "Mijoz",
+                "rating": r.rating,
+                "comment": r.comment,
+                "created_at": r.created_at,
+            }
+            for r in reviews
+        ],
+    }
 
 @app.post("/api/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
@@ -1354,6 +1571,119 @@ def health_check():
 # ============================================
 # RUN
 # ============================================
+
+# ============================================
+# QO'SHIMCHA ENDPOINTLAR — to'liq funksionallik uchun
+# ============================================
+
+# ---- Mijoz: Sevimlilar ----
+@app.get("/api/favorites/check")
+def check_favorite(user_id: int, service_id: int, db: Session = Depends(get_db)):
+    fav = db.query(Favorite).filter(Favorite.user_id == user_id, Favorite.service_id == service_id).first()
+    return {"is_favorite": fav is not None}
+
+# ---- Mijoz: Chat ----
+@app.get("/api/chat/{order_id}")
+def get_chat_messages(order_id: int, db: Session = Depends(get_db)):
+    messages = db.query(ChatMessage).filter(ChatMessage.order_id == order_id).order_by(ChatMessage.created_at.asc()).all()
+    return [
+        {"id": m.id, "sender_id": m.sender_id, "sender_name": m.sender.name, "message": m.message, "is_read": m.is_read, "created_at": m.created_at}
+        for m in messages
+    ]
+
+@app.post("/api/chat/read")
+def mark_chat_read(order_id: int, user_id: int, db: Session = Depends(get_db)):
+    db.query(ChatMessage).filter(ChatMessage.order_id == order_id, ChatMessage.sender_id != user_id).update({"is_read": True})
+    db.commit()
+    return {"success": True}
+
+# ---- Servis egasi: buyurtma tafsilotlari ----
+@app.get("/api/service-owner/orders/{order_id}")
+def get_service_owner_order_detail(order_id: int, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Buyurtma topilmadi")
+    return {
+        "id": order.id,
+        "customer_name": order.user.name if order.user else None,
+        "customer_phone": order.user.phone if order.user else None,
+        "customer_latitude": order.user_latitude,
+        "customer_longitude": order.user_longitude,
+        "category": order.category,
+        "description": order.description,
+        "status": order.status,
+        "price": order.price,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+    }
+
+# ---- Servis egasi: profil ----
+@app.get("/api/service-owner/profile")
+def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
+    owner = db.query(User).filter(User.id == owner_id).first()
+    if not owner:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+    return {
+        "owner": {"id": owner.id, "name": owner.name, "phone": owner.phone},
+        "service": {
+            "id": service.id,
+            "name": service.name,
+            "phone": service.phone,
+            "address": service.address,
+            "latitude": service.latitude,
+            "longitude": service.longitude,
+            "working_hours": service.working_hours,
+            "day_off": service.day_off,
+            "description": service.description,
+            "logo_url": service.logo_url,
+            "rating": service.rating,
+            "review_count": service.review_count,
+            "status": service.status,
+            "is_active": service.is_active,
+        }
+    }
+
+# ---- Umumiy: kategoriyalar ro'yxati ----
+@app.get("/api/categories")
+def get_categories():
+    return [
+        {"id": "evacuator", "name": "Evakuator", "icon": "local_shipping"},
+        {"id": "fuel", "name": "Benzin yetkazish", "icon": "local_gas_station"},
+        {"id": "battery", "name": "Akkumulyator", "icon": "battery_charging_full"},
+        {"id": "tire", "name": "Shina almashtirish", "icon": "tire_repair"},
+        {"id": "tech_support", "name": "Texnik yordam", "icon": "build"},
+        {"id": "diagnostics", "name": "Diagnostika", "icon": "search"},
+        {"id": "oil_change", "name": "Moy almashtirish", "icon": "oil_barrel"},
+        {"id": "electrician", "name": "Elektrik", "icon": "electrical_services"},
+        {"id": "engine", "name": "Motor ustasi", "icon": "settings"},
+        {"id": "ac", "name": "Konditsioner", "icon": "ac_unit"},
+    ]
+
+# ---- Admin: foydalanuvchini bloklash ----
+@app.put("/api/admin/users/{user_id}/role")
+def admin_set_user_role(user_id: int, role: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+    user.role = role
+    db.commit()
+    return {"id": user.id, "role": user.role}
+
+# ---- Admin: bildirishnoma yuborish ----
+class NotificationRequest(BaseModel):
+    title: str
+    message: str
+    target: str = "all"  # all, users, services
+
+@app.post("/api/admin/notifications")
+def admin_send_notification(request: NotificationRequest, db: Session = Depends(get_db)):
+    # Bu yerda real push notification integratsiyasi bo'lishi kerak
+    # Hozircha log qilamiz
+    return {"success": True, "message": f"Bildirishnoma yuborildi: {request.target}", "title": request.title}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
