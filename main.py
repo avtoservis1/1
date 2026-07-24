@@ -764,6 +764,65 @@ def service_owner_status(service_id: int, db: Session = Depends(get_db)):
         "reject_reason": service.reject_reason,
     }
 
+@app.get("/api/service-owner/service")
+def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
+    """Berilgan owner_id (foydalanuvchi id) ga tegishli servisni qaytaradi.
+    Login qilgandan keyin (yoki ilova qayta ochilganda) servis egasini o'z
+    holatiga (pending/approved/rejected) qarab to'g'ri ekranga yo'naltirish
+    uchun ishlatiladi."""
+    owner = db.query(User).filter(User.id == owner_id).first()
+    if not owner:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+    if owner.role != UserRole.SERVICE_OWNER.value:
+        raise HTTPException(status_code=403, detail="Bu foydalanuvchi servis egasi emas")
+
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    return {
+        "id": service.id,
+        "name": service.name,
+        "status": service.status,
+        "is_verified": service.is_verified,
+        "is_active": service.is_active,
+        "reject_reason": service.reject_reason,
+        "address": service.address,
+        "phone": service.phone,
+        "rating": service.rating,
+        "review_count": service.review_count,
+    }
+
+@app.get("/api/service-owner/orders")
+def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
+    """Servis egasining o'z serviciga tushgan buyurtmalari ro'yxati (dashboard uchun)."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        return []
+
+    orders = (
+        db.query(Order)
+        .filter(Order.service_id == service.id)
+        .order_by(Order.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": o.id,
+            "customer_name": o.user.name if o.user else None,
+            "customer_phone": o.user.phone if o.user else None,
+            "category": o.category,
+            "description": o.description,
+            "status": o.status,
+            "price": o.price,
+            "user_latitude": o.user_latitude,
+            "user_longitude": o.user_longitude,
+            "created_at": o.created_at,
+            "updated_at": o.updated_at,
+        }
+        for o in orders
+    ]
+
 @app.post("/api/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
     """Foydalanuvchi login"""
