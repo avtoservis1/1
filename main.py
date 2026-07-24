@@ -115,7 +115,7 @@ class Service(Base):
     address = Column(String(500), nullable=False)
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
-    logo_url = Column(String(500), nullable=True)
+    logo_url = Column(Text, nullable=True)  # stores base64 data-URL, can be very long
     images = Column(Text, nullable=True)  # JSON array of image URLs
     working_hours = Column(String(100), nullable=True)  # e.g., "09:00-18:00"
     day_off = Column(String(50), nullable=True)  # e.g., "Yakshanba"
@@ -257,6 +257,37 @@ def sync_missing_columns():
                 )
 
 sync_missing_columns()
+
+# ============================================
+# ONE-OFF FIX: widen services.logo_url to TEXT
+# ============================================
+# This column used to be VARCHAR(500), but the app stores full base64
+# data-URLs (often 50k+ characters) in it, which caused
+# "StringDataRightTruncation" errors on /api/service-owner/register.
+# sync_missing_columns() only adds columns that don't exist yet — it can't
+# change the type of a column that's already there — so that has to be
+# done explicitly here.
+def widen_logo_url_column():
+    import logging
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "services" not in inspector.get_table_names():
+        return
+    columns = {col["name"]: col for col in inspector.get_columns("services")}
+    logo_col = columns.get("logo_url")
+    if logo_col is None:
+        return
+    # get_columns() reports the SQLAlchemy-mapped python type string in
+    # col["type"]; only run the ALTER if it's still a bounded VARCHAR.
+    if "VARCHAR" in str(logo_col["type"]).upper():
+        with engine.begin() as conn:
+            conn.execute(text('ALTER TABLE "services" ALTER COLUMN "logo_url" TYPE TEXT'))
+        logging.getLogger("uvicorn.error").warning(
+            "[auto-migration] widened services.logo_url from VARCHAR(500) to TEXT"
+        )
+
+widen_logo_url_column()
 
 # ============================================
 # PYDANTIC SCHEMAS
