@@ -330,6 +330,7 @@ class ServiceOwnerRegisterRequest(BaseModel):
     phone: str
     first_name: str
     last_name: str
+    password: str = Field(..., min_length=6)
     service_name: str
     address: str
     latitude: float
@@ -634,7 +635,7 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
     full_name = f"{request.first_name} {request.last_name}".strip()
 
     if not user:
-        password_hash = hash_password(f"otp-{request.phone.replace('+', '')}")
+        password_hash = hash_password(request.password)
         user = User(
             phone=request.phone,
             name=full_name,
@@ -648,6 +649,7 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
     else:
         user.name = full_name
         user.role = UserRole.SERVICE_OWNER.value
+        user.password_hash = hash_password(request.password)
         db.commit()
 
     service = Service(
