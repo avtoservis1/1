@@ -8,6 +8,7 @@ import os
 import random
 import hashlib
 import datetime
+import logging
 import requests
 from typing import Optional, List
 from contextlib import asynccontextmanager
@@ -443,6 +444,44 @@ def generate_token(user_id: int) -> str:
 
 def generate_otp() -> str:
     return str(random.randint(1000, 9999))
+
+# ============================================
+# ADMIN BOOTSTRAP
+# ============================================
+# There's no /api/admin/register endpoint on purpose (admin accounts
+# shouldn't be self-serve), so a default admin account is created here on
+# startup if it doesn't exist yet. Login is via the normal /api/login
+# endpoint with the phone + password below; the response's `role` field
+# will be "admin" and admin_main.dart's AdminApi.login() accepts it.
+DEFAULT_ADMIN_PHONE = "+998901234567"
+DEFAULT_ADMIN_PASSWORD = "avtoservis"
+
+def bootstrap_admin():
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.phone == DEFAULT_ADMIN_PHONE).first()
+        if existing:
+            # Make sure it stays an admin even if something else changed it.
+            if existing.role != UserRole.ADMIN.value:
+                existing.role = UserRole.ADMIN.value
+                db.commit()
+            return
+        admin = User(
+            phone=DEFAULT_ADMIN_PHONE,
+            name="Admin",
+            password_hash=hash_password(DEFAULT_ADMIN_PASSWORD),
+            role=UserRole.ADMIN.value,
+            is_active=True,
+        )
+        db.add(admin)
+        db.commit()
+        logging.getLogger("uvicorn.error").warning(
+            f"[bootstrap] created default admin account: {DEFAULT_ADMIN_PHONE}"
+        )
+    finally:
+        db.close()
+
+bootstrap_admin()
 
 # ============================================
 # SMS YUBORISH (ESKIZ.UZ)
