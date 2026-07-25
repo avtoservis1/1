@@ -127,6 +127,10 @@ class Service(Base):
     # Admin moderation workflow: pending -> approved / rejected
     status = Column(String(20), default="pending")
     reject_reason = Column(Text, nullable=True)
+    # "auto_service" (oddiy avtoservis), "evacuator" (evakuator), "fuel" (benzin dastavka).
+    # Evakuator va benzin dastavka - alohida turdagi provayderlar bo'lib, har doim
+    # asosiy kategoriyalar ro'yxatida ko'rinadi va o'z ro'yxatdan o'tish oqimiga ega.
+    provider_type = Column(String(20), default="auto_service")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -137,13 +141,25 @@ class Service(Base):
     favorites = relationship("Favorite", back_populates="service")
 
 class ServiceOffered(Base):
+    """
+    Bitta avtoservis ichida ko'rsatiladigan aniq xizmat (masalan "Motor diagnostikasi",
+    "AC to'ldirish" va h.k). Nomi endi erkin matn - avvalgi qattiq belgilangan
+    kategoriyalar ro'yxati emas. Servis egasi qo'shganda "pending" holatda boshlanadi
+    va admin tasdiqlagunicha foydalanuvchilarga ko'rinmaydi. Admin xohlagan servis
+    egasiga xizmatni to'g'ridan-to'g'ri (avtomatik tasdiqlangan holda) qo'sha oladi.
+    """
     __tablename__ = "services_offered"
 
     id = Column(Integer, primary_key=True, index=True)
     service_id = Column(Integer, ForeignKey("services.id"), nullable=False)
-    category = Column(String(50), nullable=False)
+    category = Column(String(200), nullable=False)  # xizmat nomi (erkin matn)
     price = Column(Float, nullable=True)
     is_active = Column(Boolean, default=True)
+    # Tasdiqlash oqimi: pending -> approved / rejected
+    status = Column(String(20), default="pending")
+    reject_reason = Column(Text, nullable=True)
+    added_by_admin = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     service = relationship("Service", back_populates="services_offered")
 
@@ -291,6 +307,32 @@ def widen_logo_url_column():
 widen_logo_url_column()
 
 # ============================================
+# ONE-OFF FIX: widen services_offered.category to VARCHAR(200)
+# ============================================
+# This used to hold a fixed short category slug (e.g. "battery"); now it
+# holds a free-text custom service name typed by the service owner, which
+# can be longer than the old VARCHAR(50) limit.
+def widen_services_offered_category_column():
+    import logging
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "services_offered" not in inspector.get_table_names():
+        return
+    columns = {col["name"]: col for col in inspector.get_columns("services_offered")}
+    cat_col = columns.get("category")
+    if cat_col is None:
+        return
+    if "VARCHAR(50)" in str(cat_col["type"]).upper():
+        with engine.begin() as conn:
+            conn.execute(text('ALTER TABLE "services_offered" ALTER COLUMN "category" TYPE VARCHAR(200)'))
+        logging.getLogger("uvicorn.error").warning(
+            "[auto-migration] widened services_offered.category from VARCHAR(50) to VARCHAR(200)"
+        )
+
+widen_services_offered_category_column()
+
+# ============================================
 # PYDANTIC SCHEMAS
 # ============================================
 class PhoneRequest(BaseModel):
@@ -357,6 +399,7 @@ class ServiceCreate(BaseModel):
     longitude: float
     working_hours: Optional[str] = None
     categories: List[str] = []
+    provider_type: str = "auto_service"
 
 class ServiceOwnerRegisterRequest(BaseModel):
     phone: str
@@ -369,6 +412,11 @@ class ServiceOwnerRegisterRequest(BaseModel):
     longitude: float
     day_off: Optional[str] = None
     logo_base64: Optional[str] = None  # data-URL or raw base64 of the logo image
+    # "auto_service" | "evacuator" | "fuel" - qaysi turdagi provayder sifatida
+    # royxatdan otayotgani. Evakuator va benzin dastavka uchun keyinchalik
+    # oziga xos royxatdan otish maydonlari qoshiladi, hozircha xuddi shu
+    # forma orqali (faqat provider_type belgisi bilan) royxatga olinadi.
+    provider_type: str = "auto_service"
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -403,7 +451,19 @@ class ServiceOwnerProfileUpdate(BaseModel):
     logo_base64: Optional[str] = None
 
 class ServiceOfferedUpsert(BaseModel):
-    """Servis egasi 'Xizmatlarni boshqarish' bo'limida bitta xizmat narxi/holatini yuboradi."""
+    """Servis egasi 'Xizmatlarni boshqarish' bo'limida yangi xizmat (erkin nomli)
+    qo'shadi yoki mavjudining narxi/holatini yangilaydi. Yangi xizmat har doim
+    admin tasdiqlashini kutadigan 'pending' holatda yaratiladi."""
+    category: str  # xizmat nomi, masalan "Motor diagnostikasi" (erkin matn)
+    price: Optional[float] = None
+    is_active: bool = True
+
+class ServiceOfferedRejectRequest(BaseModel):
+    reason: Optional[str] = None
+
+class AdminAddOfferedServiceRequest(BaseModel):
+    """Admin xohlagan servis egasiga (service_id orqali) to'g'ridan-to'g'ri
+    xizmat qo'shadi - bunday yozuv avtomatik 'approved' holatda yaratiladi."""
     category: str
     price: Optional[float] = None
     is_active: bool = True
@@ -749,6 +809,7 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
         longitude=request.longitude,
         day_off=request.day_off,
         logo_url=request.logo_base64,
+        provider_type=request.provider_type,
         is_active=False,   # admin tasdiqlamaguncha ro'yxatda ko'rinmaydi
         is_verified=False,
         status="pending",
@@ -766,6 +827,7 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
         "user_id": user.id,
         "service_id": service.id,
         "status": service.status,
+        "provider_type": service.provider_type,
     }
 
 @app.get("/api/service-owner/status")
@@ -886,19 +948,32 @@ def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpda
 
 @app.get("/api/service-owner/services-offered")
 def list_services_offered(owner_id: int, db: Session = Depends(get_db)):
-    """Servis egasi boshqaradigan xizmatlar ro'yxati (narx va faol/nofaol holati)."""
+    """Servis egasi boshqaradigan xizmatlar ro'yxati (narx, holat va tasdiqlash statusi).
+    Bu yerda pending/rejected xizmatlar ham ko'rsatiladi - servis egasi ularning
+    holatini ko'rib turishi uchun. Foydalanuvchilarga esa faqat 'approved' bo'lganlari
+    chiqadi (bunga /api/services va /api/services/{id} javob beradi)."""
     service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
     if not service:
         return []
-    items = db.query(ServiceOffered).filter(ServiceOffered.service_id == service.id).all()
+    items = db.query(ServiceOffered).filter(ServiceOffered.service_id == service.id).order_by(ServiceOffered.id.desc()).all()
     return [
-        {"id": i.id, "category": i.category, "price": i.price, "is_active": i.is_active}
+        {
+            "id": i.id,
+            "category": i.category,
+            "price": i.price,
+            "is_active": i.is_active,
+            "status": i.status,
+            "reject_reason": i.reject_reason,
+            "added_by_admin": i.added_by_admin,
+        }
         for i in items
     ]
 
 @app.post("/api/service-owner/services-offered")
 def upsert_service_offered(owner_id: int, request: ServiceOfferedUpsert, db: Session = Depends(get_db)):
-    """Xizmat qo'shadi, mavjud bo'lsa (bir xil category) narxi/holatini yangilaydi."""
+    """Yangi xizmat qo'shadi (har doim 'pending' holatda - admin tasdiqlashi kerak),
+    yoki mavjud bo'lsa (bir xil nom) narxi/faol-nofaol holatini yangilaydi (bu holat
+    o'zgarishi qayta tasdiqlashni talab qilmaydi)."""
     service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
@@ -912,11 +987,24 @@ def upsert_service_offered(owner_id: int, request: ServiceOfferedUpsert, db: Ses
         item.price = request.price
         item.is_active = request.is_active
     else:
-        item = ServiceOffered(service_id=service.id, category=request.category, price=request.price, is_active=request.is_active)
+        item = ServiceOffered(
+            service_id=service.id,
+            category=request.category,
+            price=request.price,
+            is_active=request.is_active,
+            status="pending",
+            added_by_admin=False,
+        )
         db.add(item)
     db.commit()
     db.refresh(item)
-    return {"id": item.id, "category": item.category, "price": item.price, "is_active": item.is_active}
+    return {
+        "id": item.id,
+        "category": item.category,
+        "price": item.price,
+        "is_active": item.is_active,
+        "status": item.status,
+    }
 
 @app.delete("/api/service-owner/services-offered/{item_id}")
 def delete_service_offered(item_id: int, db: Session = Depends(get_db)):
@@ -926,6 +1014,83 @@ def delete_service_offered(item_id: int, db: Session = Depends(get_db)):
     db.delete(item)
     db.commit()
     return {"success": True}
+
+# ============================================
+# ADMIN: XIZMATLARNI TASDIQLASH (services_offered)
+# ============================================
+@app.get("/api/admin/services-offered/pending")
+def admin_list_pending_offered_services(db: Session = Depends(get_db)):
+    """Admin tasdiqlashini kutayotgan barcha xizmatlar ro'yxati (barcha servislar bo'yicha)."""
+    items = (
+        db.query(ServiceOffered)
+        .filter(ServiceOffered.status == "pending")
+        .order_by(ServiceOffered.created_at.asc())
+        .all()
+    )
+    return [
+        {
+            "id": i.id,
+            "category": i.category,
+            "price": i.price,
+            "service_id": i.service_id,
+            "service_name": i.service.name if i.service else None,
+            "owner_name": i.service.owner.name if i.service and i.service.owner else None,
+            "created_at": i.created_at,
+        }
+        for i in items
+    ]
+
+@app.put("/api/admin/services-offered/{item_id}/approve")
+def admin_approve_offered_service(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(ServiceOffered).filter(ServiceOffered.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Xizmat topilmadi")
+    item.status = "approved"
+    item.reject_reason = None
+    db.commit()
+    return {"id": item.id, "status": item.status}
+
+@app.put("/api/admin/services-offered/{item_id}/reject")
+def admin_reject_offered_service(item_id: int, request: ServiceOfferedRejectRequest, db: Session = Depends(get_db)):
+    item = db.query(ServiceOffered).filter(ServiceOffered.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Xizmat topilmadi")
+    item.status = "rejected"
+    item.reject_reason = request.reason
+    db.commit()
+    return {"id": item.id, "status": item.status, "reject_reason": item.reject_reason}
+
+@app.post("/api/admin/services/{service_id}/services-offered")
+def admin_add_offered_service(service_id: int, request: AdminAddOfferedServiceRequest, db: Session = Depends(get_db)):
+    """Admin xohlagan servis egasiga (service_id bo'yicha) to'g'ridan-to'g'ri xizmat
+    qo'shadi. Bunday yozuv qo'shimcha tasdiqlashsiz darhol 'approved' bo'ladi."""
+    service = db.query(Service).filter(Service.id == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    item = (
+        db.query(ServiceOffered)
+        .filter(ServiceOffered.service_id == service_id, ServiceOffered.category == request.category)
+        .first()
+    )
+    if item:
+        item.price = request.price
+        item.is_active = request.is_active
+        item.status = "approved"
+        item.reject_reason = None
+    else:
+        item = ServiceOffered(
+            service_id=service_id,
+            category=request.category,
+            price=request.price,
+            is_active=request.is_active,
+            status="approved",
+            added_by_admin=True,
+        )
+        db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id, "category": item.category, "price": item.price, "status": item.status}
 
 @app.get("/api/service-owner/dashboard")
 def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
@@ -1131,6 +1296,7 @@ def create_service(owner_id: int, service: ServiceCreate, db: Session = Depends(
         latitude=service.latitude,
         longitude=service.longitude,
         working_hours=service.working_hours,
+        provider_type=service.provider_type,
         is_active=True,
         is_verified=False
     )
@@ -1138,9 +1304,9 @@ def create_service(owner_id: int, service: ServiceCreate, db: Session = Depends(
     db.commit()
     db.refresh(new_service)
 
-    # Add offered services
+    # Add offered services (servis egasi tomonidan - tasdiqlanishi kerak)
     for cat in service.categories:
-        offered = ServiceOffered(service_id=new_service.id, category=cat)
+        offered = ServiceOffered(service_id=new_service.id, category=cat, status="pending")
         db.add(offered)
     db.commit()
 
@@ -1154,10 +1320,24 @@ def get_services(
     category: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
+    """
+    - category == "evacuator" yoki "fuel": shu turdagi provayderlarni qaytaradi
+      (Service.provider_type bo'yicha) - bular har doim mavjud, alohida ro'yxatdan
+      o'tgan provayderlar.
+    - category berilmasa: oddiy avtoservislar ro'yxati (provider_type == "auto_service").
+    - boshqa category qiymati: eskirgan/qo'shimcha holat uchun, faqat tasdiqlangan
+      (approved) xizmat sifatida shu nomni taklif qiladigan avtoservislar.
+    """
     query = db.query(Service).filter(Service.is_active == True)
 
-    if category:
-        query = query.join(ServiceOffered).filter(ServiceOffered.category == category)
+    if category in ("evacuator", "fuel"):
+        query = query.filter(Service.provider_type == category)
+    elif category:
+        query = query.join(ServiceOffered).filter(
+            ServiceOffered.category == category, ServiceOffered.status == "approved"
+        )
+    else:
+        query = query.filter(Service.provider_type == "auto_service")
 
     services = query.all()
 
@@ -1180,11 +1360,12 @@ def get_services(
             "rating": s.rating,
             "review_count": s.review_count,
             "working_hours": s.working_hours,
+            "provider_type": s.provider_type,
             "distance": round(distance, 2) if distance else None,
-            "categories": [o.category for o in s.services_offered if o.is_active]
+            "categories": [o.category for o in s.services_offered if o.is_active and o.status == "approved"]
         })
 
-    if distance is not None:
+    if lat is not None and lng is not None:
         result.sort(key=lambda x: x["distance"] or float('inf'))
 
     return result
@@ -1206,10 +1387,14 @@ def get_service_detail(service_id: int, db: Session = Depends(get_db)):
         "rating": service.rating,
         "review_count": service.review_count,
         "working_hours": service.working_hours,
+        "provider_type": service.provider_type,
         "images": service.images,
+        # Foydalanuvchiga faqat admin tomonidan tasdiqlangan (approved) xizmatlar
+        # ko'rinadi - servis egasi yoki admin qo'shgan va tasdiqlangan xizmatlar.
         "categories": [
             {"category": o.category, "price": o.price, "is_active": o.is_active}
             for o in service.services_offered
+            if o.status == "approved"
         ],
         "reviews": [
             {"rating": r.rating, "comment": r.comment, "user_name": r.user.name, "created_at": r.created_at}
@@ -1465,11 +1650,14 @@ def admin_get_orders(status: Optional[str] = None, db: Session = Depends(get_db)
     ]
 
 @app.get("/api/admin/services")
-def admin_get_services(status: Optional[str] = None, db: Session = Depends(get_db)):
-    """status: 'pending' | 'approved' | 'rejected' | None (hammasi)"""
+def admin_get_services(status: Optional[str] = None, provider_type: Optional[str] = None, db: Session = Depends(get_db)):
+    """status: 'pending' | 'approved' | 'rejected' | None (hammasi)
+    provider_type: 'auto_service' | 'evacuator' | 'fuel' | None (hammasi)"""
     query = db.query(Service)
     if status:
         query = query.filter(Service.status == status)
+    if provider_type:
+        query = query.filter(Service.provider_type == provider_type)
     services = query.order_by(Service.created_at.desc()).all()
     return [
         {
@@ -1489,6 +1677,7 @@ def admin_get_services(status: Optional[str] = None, db: Session = Depends(get_d
             "status": s.status,
             "reject_reason": s.reject_reason,
             "rating": s.rating,
+            "provider_type": s.provider_type,
             "created_at": s.created_at
         }
         for s in services
@@ -1649,17 +1838,19 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
 # ---- Umumiy: kategoriyalar ro'yxati ----
 @app.get("/api/categories")
 def get_categories():
+    """
+    Asosiy ekrandagi 'Xizmat turlari' ro'yxati. Avvalgi 8 ta qattiq belgilangan
+    kichik kategoriya (akkumulyator, shina va h.k.) olib tashlandi - endi har bir
+    avtoservis o'zi xohlagan nomdagi xizmatni qo'shadi (admin tasdiqlashi bilan) va
+    bu xizmatlar shu servisning profilida ko'rinadi, umumiy filtr sifatida emas.
+    Evakuator va Benzin dastavka - har doim mavjud bo'lgan, alohida ro'yxatdan
+    o'tish oqimiga ega maxsus provayder turlari, shuning uchun har doim shu yerda
+    turadi.
+    """
     return [
         {"id": "evacuator", "name": "Evakuator", "icon": "local_shipping"},
         {"id": "fuel", "name": "Benzin yetkazish", "icon": "local_gas_station"},
-        {"id": "battery", "name": "Akkumulyator", "icon": "battery_charging_full"},
-        {"id": "tire", "name": "Shina almashtirish", "icon": "tire_repair"},
-        {"id": "tech_support", "name": "Texnik yordam", "icon": "build"},
-        {"id": "diagnostics", "name": "Diagnostika", "icon": "search"},
-        {"id": "oil_change", "name": "Moy almashtirish", "icon": "oil_barrel"},
-        {"id": "electrician", "name": "Elektrik", "icon": "electrical_services"},
-        {"id": "engine", "name": "Motor ustasi", "icon": "settings"},
-        {"id": "ac", "name": "Konditsioner", "icon": "ac_unit"},
+        {"id": "auto_service", "name": "Avtoservislar", "icon": "build"},
     ]
 
 # ---- Admin: foydalanuvchini bloklash ----
