@@ -140,28 +140,49 @@ class Service(Base):
     reviews = relationship("Review", back_populates="service")
     favorites = relationship("Favorite", back_populates="service")
 
+class ServiceType(Base):
+    """
+    Admin tomonidan boshqariladigan umumiy xizmat turlari katalogi (masalan
+    "Motor diagnostikasi", "AC to'ldirish" va h.k). Nomi va narxini FAQAT admin
+    belgilaydi. Servis egalari bu katalogdan o'zida mavjud bo'lgan turlarni
+    tanlab (belgilab) qo'yishi mumkin - ular narx yoki nom kirita olmaydi.
+    """
+    __tablename__ = "service_types"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(200), nullable=False)  # xizmat turi nomi - admin belgilaydi
+    price = Column(Float, nullable=True)  # narxi - admin belgilaydi
+    icon = Column(String(50), default="build")  # frontendda ko'rsatiladigan ikonka nomi
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    services_offered = relationship("ServiceOffered", back_populates="service_type")
+
 class ServiceOffered(Base):
     """
-    Bitta avtoservis ichida ko'rsatiladigan aniq xizmat (masalan "Motor diagnostikasi",
-    "AC to'ldirish" va h.k). Nomi endi erkin matn - avvalgi qattiq belgilangan
-    kategoriyalar ro'yxati emas. Servis egasi qo'shganda "pending" holatda boshlanadi
-    va admin tasdiqlagunicha foydalanuvchilarga ko'rinmaydi. Admin xohlagan servis
-    egasiga xizmatni to'g'ridan-to'g'ri (avtomatik tasdiqlangan holda) qo'sha oladi.
+    Bitta avtoservis taklif qiladigan xizmat turi. Xizmat turining nomi va narxi
+    endi admin boshqaradigan ServiceType katalogidan olinadi (service_type_id) -
+    servis egasi faqat o'zida mavjud turlarni belgilab (yoqib/o'chirib) qo'yadi.
+    Admin katalogidan tanlangani uchun bunday yozuvlar darhol 'approved' holatda
+    yaratiladi - qo'shimcha tasdiqlash shart emas. (Eski erkin-matnli yozuvlar
+    bilan orqaga moslik uchun `category` va pending/rejected oqimi saqlab qolindi.)
     """
     __tablename__ = "services_offered"
 
     id = Column(Integer, primary_key=True, index=True)
     service_id = Column(Integer, ForeignKey("services.id"), nullable=False)
-    category = Column(String(200), nullable=False)  # xizmat nomi (erkin matn)
+    service_type_id = Column(Integer, ForeignKey("service_types.id"), nullable=True)
+    category = Column(String(200), nullable=False)  # xizmat nomi (service_type.name dan nusxa)
     price = Column(Float, nullable=True)
     is_active = Column(Boolean, default=True)
-    # Tasdiqlash oqimi: pending -> approved / rejected
+    # Tasdiqlash oqimi: pending -> approved / rejected (eski erkin-matn oqimi uchun)
     status = Column(String(20), default="pending")
     reject_reason = Column(Text, nullable=True)
     added_by_admin = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     service = relationship("Service", back_populates="services_offered")
+    service_type = relationship("ServiceType", back_populates="services_offered")
 
 class Order(Base):
     __tablename__ = "orders"
@@ -472,6 +493,25 @@ class ServiceOfferedUpsert(BaseModel):
 
 class ServiceOfferedRejectRequest(BaseModel):
     reason: Optional[str] = None
+
+class ServiceTypeCreate(BaseModel):
+    """Admin yangi xizmat turi qo'shadi - nomi va narxini admin belgilaydi."""
+    name: str
+    price: Optional[float] = None
+    icon: Optional[str] = "build"
+
+class ServiceTypeUpdate(BaseModel):
+    """Admin mavjud xizmat turini tahrirlaydi (nomi, narxi, ikonkasi, holati)."""
+    name: Optional[str] = None
+    price: Optional[float] = None
+    icon: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class ServiceOwnerTypeToggle(BaseModel):
+    """Servis egasi admin katalogidagi xizmat turini o'zida bor/yo'qligini belgilaydi.
+    Nomi va narxini o'zi kirita olmaydi - bular katalogdan (ServiceType) olinadi."""
+    service_type_id: int
+    is_active: bool = True
 
 class AdminAddOfferedServiceRequest(BaseModel):
     """Admin xohlagan servis egasiga (service_id orqali) to'g'ridan-to'g'ri
@@ -977,6 +1017,7 @@ def list_services_offered(owner_id: int, db: Session = Depends(get_db)):
             "status": i.status,
             "reject_reason": i.reject_reason,
             "added_by_admin": i.added_by_admin,
+            "service_type_id": i.service_type_id,
         }
         for i in items
     ]
@@ -1024,6 +1065,156 @@ def delete_service_offered(item_id: int, db: Session = Depends(get_db)):
     if not item:
         raise HTTPException(status_code=404, detail="Xizmat topilmadi")
     db.delete(item)
+    db.commit()
+    return {"success": True}
+
+# ============================================
+# XIZMAT TURLARI KATALOGI (ServiceType)
+# ============================================
+# Nomi va narxini FAQAT admin belgilaydi. Servis egalari shu katalogdan
+# o'zida mavjud bo'lgan turlarni tanlab (belgilab) qo'yadi, foydalanuvchilar
+# esa shu turlar bo'yicha qidiradi/filtrlaydi.
+
+@app.get("/api/service-types")
+def list_active_service_types(db: Session = Depends(get_db)):
+    """Barcha faol xizmat turlari (servis egalari tanlashi va foydalanuvchilar
+    ko'rishi uchun ochiq ro'yxat)."""
+    types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
+    return [{"id": t.id, "name": t.name, "price": t.price, "icon": t.icon} for t in types]
+
+@app.get("/api/service-owner/service-types")
+def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
+    """Servis egasi uchun: admin katalogidagi barcha faol xizmat turlari,
+    har biri uchun shu servisda yoqilgan/yoqilmaganligi bilan birga."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    selected = {}
+    if service:
+        offered = db.query(ServiceOffered).filter(
+            ServiceOffered.service_id == service.id, ServiceOffered.service_type_id.isnot(None)
+        ).all()
+        selected = {o.service_type_id: o for o in offered}
+
+    types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "price": t.price,
+            "icon": t.icon,
+            "is_selected": t.id in selected and selected[t.id].is_active,
+        }
+        for t in types
+    ]
+
+@app.post("/api/service-owner/service-types")
+def toggle_service_type(owner_id: int, request: ServiceOwnerTypeToggle, db: Session = Depends(get_db)):
+    """Servis egasi admin katalogidagi bir xizmat turini o'zida bor deb belgilaydi
+    (yoki o'chiradi). Nomi va narxi katalogdan (ServiceType) ko'chiriladi - servis
+    egasi ularni o'zgartira olmaydi. Katalogdan tanlangani uchun darhol 'approved'
+    holatda saqlanadi - qo'shimcha admin tasdiqlash shart emas."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    stype = db.query(ServiceType).filter(ServiceType.id == request.service_type_id).first()
+    if not stype:
+        raise HTTPException(status_code=404, detail="Xizmat turi topilmadi")
+
+    item = (
+        db.query(ServiceOffered)
+        .filter(ServiceOffered.service_id == service.id, ServiceOffered.service_type_id == stype.id)
+        .first()
+    )
+    if item:
+        item.is_active = request.is_active
+        item.category = stype.name
+        item.price = stype.price
+        item.status = "approved"
+        item.reject_reason = None
+    else:
+        item = ServiceOffered(
+            service_id=service.id,
+            service_type_id=stype.id,
+            category=stype.name,
+            price=stype.price,
+            is_active=request.is_active,
+            status="approved",
+            added_by_admin=False,
+        )
+        db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {
+        "id": item.id,
+        "service_type_id": stype.id,
+        "category": item.category,
+        "price": item.price,
+        "is_active": item.is_active,
+    }
+
+# ============================================
+# ADMIN: XIZMAT TURLARI KATALOGINI BOSHQARISH
+# ============================================
+
+@app.get("/api/admin/service-types")
+def admin_list_service_types(db: Session = Depends(get_db)):
+    """Admin panelidagi xizmat turlari katalogi - faol va nofaol turlar ham chiqadi."""
+    types = db.query(ServiceType).order_by(ServiceType.id.desc()).all()
+    return [
+        {"id": t.id, "name": t.name, "price": t.price, "icon": t.icon, "is_active": t.is_active}
+        for t in types
+    ]
+
+@app.post("/api/admin/service-types")
+def admin_create_service_type(request: ServiceTypeCreate, db: Session = Depends(get_db)):
+    """Admin yangi xizmat turi (nomi va narxi bilan) qo'shadi."""
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Xizmat turi nomi bo'sh bo'lishi mumkin emas")
+    existing = db.query(ServiceType).filter(func.lower(ServiceType.name) == name.lower()).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Bu nomdagi xizmat turi allaqachon mavjud")
+    stype = ServiceType(name=name, price=request.price, icon=request.icon or "build", is_active=True)
+    db.add(stype)
+    db.commit()
+    db.refresh(stype)
+    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "is_active": stype.is_active}
+
+@app.put("/api/admin/service-types/{type_id}")
+def admin_update_service_type(type_id: int, request: ServiceTypeUpdate, db: Session = Depends(get_db)):
+    """Admin mavjud xizmat turini (nomi/narxi/ikonkasi/holati) tahrirlaydi.
+    O'zgarish shu turni tanlagan barcha servislarga ham darhol qo'llanadi."""
+    stype = db.query(ServiceType).filter(ServiceType.id == type_id).first()
+    if not stype:
+        raise HTTPException(status_code=404, detail="Xizmat turi topilmadi")
+
+    if request.name is not None and request.name.strip():
+        stype.name = request.name.strip()
+    if request.price is not None:
+        stype.price = request.price
+    if request.icon is not None:
+        stype.icon = request.icon
+    if request.is_active is not None:
+        stype.is_active = request.is_active
+    db.commit()
+    db.refresh(stype)
+
+    # Bu turni tanlagan servislardagi nomi/narxini ham katalog bilan sinxronlaymiz
+    db.query(ServiceOffered).filter(ServiceOffered.service_type_id == stype.id).update(
+        {"category": stype.name, "price": stype.price}, synchronize_session=False
+    )
+    db.commit()
+    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "is_active": stype.is_active}
+
+@app.delete("/api/admin/service-types/{type_id}")
+def admin_delete_service_type(type_id: int, db: Session = Depends(get_db)):
+    """Admin xizmat turini katalogdan butunlay o'chiradi (uni tanlagan servislardagi
+    yozuvlar ham birga o'chadi)."""
+    stype = db.query(ServiceType).filter(ServiceType.id == type_id).first()
+    if not stype:
+        raise HTTPException(status_code=404, detail="Xizmat turi topilmadi")
+    db.query(ServiceOffered).filter(ServiceOffered.service_type_id == stype.id).delete(synchronize_session=False)
+    db.delete(stype)
     db.commit()
     return {"success": True}
 
@@ -1336,14 +1527,26 @@ def get_services(
     - category == "evacuator" yoki "fuel": shu turdagi provayderlarni qaytaradi
       (Service.provider_type bo'yicha) - bular har doim mavjud, alohida ro'yxatdan
       o'tgan provayderlar.
-    - category berilmasa: oddiy avtoservislar ro'yxati (provider_type == "auto_service").
-    - boshqa category qiymati: eskirgan/qo'shimcha holat uchun, faqat tasdiqlangan
-      (approved) xizmat sifatida shu nomni taklif qiladigan avtoservislar.
+    - category == "auto_service" yoki berilmasa: oddiy avtoservislar ro'yxati
+      (provider_type == "auto_service").
+    - category raqamli qiymat (masalan "3"): admin katalogidagi shu ServiceType.id
+      xizmat turini taklif qiladigan (va uni yoqib qo'ygan) avtoservislar - foydalanuvchi
+      bosh ekrandagi xizmat turini tanlaganda aynan shu filtr ishlaydi.
+    - boshqa (eski, erkin-matnli) category qiymati: shu nomni tasdiqlangan holda
+      taklif qiladigan avtoservislar (orqaga moslik uchun).
     """
     query = db.query(Service).filter(Service.is_active == True)
 
     if category in ("evacuator", "fuel"):
         query = query.filter(Service.provider_type == category)
+    elif category == "auto_service":
+        query = query.filter(Service.provider_type == "auto_service")
+    elif category and category.isdigit():
+        query = query.join(ServiceOffered).filter(
+            ServiceOffered.service_type_id == int(category),
+            ServiceOffered.status == "approved",
+            ServiceOffered.is_active == True,
+        )
     elif category:
         query = query.join(ServiceOffered).filter(
             ServiceOffered.category == category, ServiceOffered.status == "approved"
@@ -1849,21 +2052,25 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
 
 # ---- Umumiy: kategoriyalar ro'yxati ----
 @app.get("/api/categories")
-def get_categories():
+def get_categories(db: Session = Depends(get_db)):
     """
-    Asosiy ekrandagi 'Xizmat turlari' ro'yxati. Avvalgi 8 ta qattiq belgilangan
-    kichik kategoriya (akkumulyator, shina va h.k.) olib tashlandi - endi har bir
-    avtoservis o'zi xohlagan nomdagi xizmatni qo'shadi (admin tasdiqlashi bilan) va
-    bu xizmatlar shu servisning profilida ko'rinadi, umumiy filtr sifatida emas.
-    Evakuator va Benzin dastavka - har doim mavjud bo'lgan, alohida ro'yxatdan
-    o'tish oqimiga ega maxsus provayder turlari, shuning uchun har doim shu yerda
-    turadi.
+    Asosiy ekrandagi 'Xizmat turlari' ro'yxati. Endi bu ro'yxat admin tomonidan
+    boshqariladigan ServiceType katalogidan dinamik tarzda olinadi - admin qanday
+    xizmat turi (nomi va narxi bilan) qo'shsa, shu yerda ko'rinadi. Foydalanuvchi
+    birortasini tanlasa, aynan shu turni taklif qiladigan (va yoqib qo'ygan)
+    avtoservislar unga ko'rinadi.
+    Evakuator, Benzin dastavka va Avtoservislar - har doim mavjud bo'lgan, alohida
+    provayder turlari, shuning uchun har doim ro'yxat boshida turadi.
     """
-    return [
+    result = [
         {"id": "evacuator", "name": "Evakuator", "icon": "local_shipping"},
         {"id": "fuel", "name": "Benzin yetkazish", "icon": "local_gas_station"},
         {"id": "auto_service", "name": "Avtoservislar", "icon": "build"},
     ]
+    types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
+    for t in types:
+        result.append({"id": str(t.id), "name": t.name, "icon": t.icon or "build", "price": t.price})
+    return result
 
 # ---- Admin: foydalanuvchini bloklash ----
 @app.put("/api/admin/users/{user_id}/role")
