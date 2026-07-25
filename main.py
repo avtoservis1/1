@@ -371,6 +371,18 @@ class LoginRequest(BaseModel):
     phone: str
     password: str
 
+    @validator('phone')
+    def validate_phone(cls, v):
+        # Ro'yxatdan o'tishdagi (RegisterRequest) bilan bir xil normalizatsiya.
+        # Avval bu yerda validator yo'q edi, shuning uchun agar mijoz telefon
+        # raqamni biroz boshqacharoq formatda yuborsa (probel/tire farqi va h.k.),
+        # baza bo'yicha aniq (==) qidiruv mos kelmay, "Telefon raqam yoki parol
+        # noto'g'ri" xatosi chiqardi - garchi ma'lumotlar to'g'ri bo'lsa ham.
+        v = v.replace(' ', '').replace('-', '')
+        if not v.startswith('+'):
+            raise ValueError('Telefon raqam + bilan boshlanishi kerak')
+        return v
+
 class UserResponse(BaseModel):
     id: int
     phone: str
