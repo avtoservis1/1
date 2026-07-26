@@ -134,6 +134,13 @@ class Service(Base):
     # Evakuator va benzin dastavka - alohida turdagi provayderlar bo'lib, har doim
     # asosiy kategoriyalar ro'yxatida ko'rinadi va o'z ro'yxatdan o'tish oqimiga ega.
     provider_type = Column(String(20), default="auto_service")
+    # Evakuator/benzin dastavka uchun: haydovchi ish boshlagan/tugatganini va
+    # joriy (jonli) joylashuvini kuzatish. auto_service uchun ishlatilmaydi -
+    # avtoservis xaritada har doim ko'rinadi.
+    is_online = Column(Boolean, default=False)
+    current_latitude = Column(Float, nullable=True)
+    current_longitude = Column(Float, nullable=True)
+    location_updated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -246,6 +253,27 @@ class Favorite(Base):
 
     user = relationship("User", back_populates="favorites")
     service = relationship("Service", back_populates="favorites")
+
+class Notification(Base):
+    """
+    Ilova ichidagi bildirishnomalar (push emas). Buyurtma holati o'zgarganda,
+    yangi chat xabari kelganda, admin umumiy xabar yuborganda va h.k. shu
+    jadvalga yozuv qo'shiladi. Foydalanuvchi/servis egasi qo'ng'iroqcha (bell)
+    ikonkasi orqali ro'yxatini ko'radi.
+    """
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String(200), nullable=False)
+    message = Column(Text, nullable=False)
+    # "order_status", "new_order", "chat", "admin", "review" va h.k.
+    type = Column(String(30), default="admin")
+    related_id = Column(Integer, nullable=True)  # order_id yoki boshqa tegishli yozuv id'si
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
 
 class OTPCode(Base):
     __tablename__ = "otp_codes"
@@ -491,13 +519,19 @@ class ServiceOwnerRegisterRequest(BaseModel):
 
 class ServiceEditRequest(BaseModel):
     name: Optional[str] = None
+    owner_name: Optional[str] = None  # servis egasi/haydovchining to'liq ismi (Users.name)
     phone: Optional[str] = None
     address: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     day_off: Optional[str] = None
     working_hours: Optional[str] = None
+    car_model: Optional[str] = None  # evakuator/fuel uchun: mashina rusmi/turi
     logo_base64: Optional[str] = None
+
+class LocationUpdateRequest(BaseModel):
+    latitude: float
+    longitude: float
 
 class ServiceRejectRequest(BaseModel):
     reason: Optional[str] = None
@@ -739,6 +773,34 @@ from fastapi.responses import JSONResponse
 
 logger = logging.getLogger("uvicorn.error")
 
+# ============================================
+# BILDIRISHNOMA YORDAMCHI FUNKSIYASI
+# ============================================
+def create_notification(db: Session, user_id: int, title: str, message: str, type: str = "admin", related_id: Optional[int] = None):
+    """Ilova ichidagi bildirishnoma yaratadi. Xatolik bo'lsa asosiy amalni buzmaslik uchun jimgina o'tkazib yuboradi."""
+    try:
+        notif = Notification(
+            user_id=user_id,
+            title=title,
+            message=message,
+            type=type,
+            related_id=related_id,
+        )
+        db.add(notif)
+        db.commit()
+    except Exception as e:
+        logging.error(f"Bildirishnoma yaratishda xatolik: {e}")
+        db.rollback()
+
+ORDER_STATUS_LABELS = {
+    "pending": "Kutilmoqda",
+    "accepted": "Qabul qilindi",
+    "on_way": "Yo'lda",
+    "arrived": "Yetib keldi",
+    "completed": "Yakunlandi",
+    "cancelled": "Bekor qilindi",
+}
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request, exc):
     logger.error("Unhandled exception on %s %s:\n%s", request.method, request.url.path, traceback.format_exc())
@@ -979,6 +1041,9 @@ def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
         "logo_url": service.logo_url,
         "provider_type": service.provider_type,
         "car_model": service.car_model,
+        "is_online": service.is_online,
+        "current_latitude": service.current_latitude,
+        "current_longitude": service.current_longitude,
     }
 
 @app.get("/api/service-owner/orders")
@@ -1386,6 +1451,10 @@ def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
     return {
         "service_name": service.name,
         "status": service.status,
+        "provider_type": service.provider_type,
+        "working_hours": service.working_hours,
+        "day_off": service.day_off,
+        "is_online": service.is_online,
         "rating": service.rating,
         "review_count": service.review_count,
         "today_orders": today_count,
@@ -1608,7 +1677,9 @@ def get_services(
     query = db.query(Service).filter(Service.is_active == True)
 
     if category in ("evacuator", "fuel"):
-        query = query.filter(Service.provider_type == category)
+        # Faqat hozir ish ustida (ish vaqtini boshlagan va joylashuvi yoniq)
+        # evakuator/benzin dastavkalar xaritada/ro'yxatda ko'rinadi.
+        query = query.filter(Service.provider_type == category, Service.is_online == True)
     elif category == "auto_service":
         query = query.filter(Service.provider_type == "auto_service")
     elif category and category.isdigit():
@@ -1629,10 +1700,15 @@ def get_services(
     # Calculate distance if coordinates provided
     result = []
     for s in services:
+        # Evakuator/fuel uchun statik latitude/longitude yo'q (registratsiyada
+        # kiritilmaydi) - o'rniga ish vaqtida yuborilgan jonli joylashuv ishlatiladi.
+        display_lat = s.current_latitude if s.provider_type in ("evacuator", "fuel") else s.latitude
+        display_lng = s.current_longitude if s.provider_type in ("evacuator", "fuel") else s.longitude
+
         distance = None
-        if lat is not None and lng is not None and s.latitude is not None and s.longitude is not None:
+        if lat is not None and lng is not None and display_lat is not None and display_lng is not None:
             # Simple Euclidean distance (for production use Haversine)
-            distance = ((s.latitude - lat) ** 2 + (s.longitude - lng) ** 2) ** 0.5 * 111  # km approx
+            distance = ((display_lat - lat) ** 2 + (display_lng - lng) ** 2) ** 0.5 * 111  # km approx
 
         result.append({
             "id": s.id,
@@ -1640,8 +1716,8 @@ def get_services(
             "description": s.description,
             "phone": s.phone,
             "address": s.address,
-            "latitude": s.latitude,
-            "longitude": s.longitude,
+            "latitude": display_lat,
+            "longitude": display_lng,
             "rating": s.rating,
             "review_count": s.review_count,
             "working_hours": s.working_hours,
@@ -1649,6 +1725,7 @@ def get_services(
             "provider_type": s.provider_type,
             "car_model": s.car_model,
             "logo_url": s.logo_url,
+            "is_online": s.is_online,
             "distance": round(distance, 2) if distance else None,
             "categories": [o.category for o in s.services_offered if o.is_active and o.status == "approved"]
         })
@@ -1678,6 +1755,7 @@ def get_service_detail(service_id: int, db: Session = Depends(get_db)):
         "day_off": service.day_off,
         "provider_type": service.provider_type,
         "car_model": service.car_model,
+        "is_online": service.is_online,
         "images": service.images,
         # Foydalanuvchiga faqat admin tomonidan tasdiqlangan (approved) xizmatlar
         # ko'rinadi - servis egasi yoki admin qo'shgan va tasdiqlangan xizmatlar.
@@ -1717,6 +1795,13 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     db.add(new_order)
     db.commit()
     db.refresh(new_order)
+
+    create_notification(
+        db, service.owner_id,
+        "Yangi buyurtma",
+        f"{user.name} sizga yangi buyurtma berdi: {service.name}",
+        type="new_order", related_id=new_order.id,
+    )
 
     return {
         "id": new_order.id,
@@ -1783,6 +1868,15 @@ def update_order_status(order_id: int, update: OrderStatusUpdate, db: Session = 
 
     db.commit()
     db.refresh(order)
+
+    status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
+    create_notification(
+        db, order.user_id,
+        "Buyurtma holati yangilandi",
+        f"Buyurtmangiz holati: {status_label}",
+        type="order_status", related_id=order.id,
+    )
+
     return {"id": order.id, "status": order.status}
 
 # ============================================
@@ -1802,6 +1896,16 @@ def send_message(sender_id: int, msg: ChatMessageCreate, db: Session = Depends(g
     db.add(chat_msg)
     db.commit()
     db.refresh(chat_msg)
+
+    # Xabar qarama-qarshi tomonga (mijoz <-> servis egasi) yuboriladi
+    recipient_id = order.service.owner_id if sender_id == order.user_id else order.user_id
+    sender = db.query(User).filter(User.id == sender_id).first()
+    create_notification(
+        db, recipient_id,
+        f"Yangi xabar: {sender.name if sender else ''}",
+        msg.message[:150],
+        type="chat", related_id=msg.order_id,
+    )
 
     return chat_msg
 
@@ -1969,6 +2073,9 @@ def admin_get_services(status: Optional[str] = None, provider_type: Optional[str
             "rating": s.rating,
             "provider_type": s.provider_type,
             "car_model": s.car_model,
+            "is_online": s.is_online,
+            "current_latitude": s.current_latitude,
+            "current_longitude": s.current_longitude,
             "created_at": s.created_at
         }
         for s in services
@@ -2021,12 +2128,54 @@ def admin_edit_service(service_id: int, request: ServiceEditRequest, db: Session
         service.day_off = request.day_off
     if request.working_hours is not None:
         service.working_hours = request.working_hours
+    if request.car_model is not None:
+        service.car_model = request.car_model
     if request.logo_base64 is not None:
         service.logo_url = request.logo_base64
+    if request.owner_name is not None and service.owner is not None:
+        service.owner.name = request.owner_name
 
     db.commit()
     db.refresh(service)
     return {"id": service.id, "message": "Servis ma'lumotlari yangilandi"}
+
+@app.put("/api/service-owner/go-online")
+def service_owner_go_online(owner_id: int, request: LocationUpdateRequest, db: Session = Depends(get_db)):
+    """Evakuator/benzin dastavka ish boshlaydi: joriy joylashuvini yuborib,
+    xaritada ko'rinadigan (is_online=True) holatga o'tadi."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+    if service.provider_type not in ("evacuator", "fuel"):
+        raise HTTPException(status_code=400, detail="Bu faqat evakuator/benzin dastavka uchun")
+    service.is_online = True
+    service.current_latitude = request.latitude
+    service.current_longitude = request.longitude
+    service.location_updated_at = func.now()
+    db.commit()
+    return {"is_online": True}
+
+@app.put("/api/service-owner/go-offline")
+def service_owner_go_offline(owner_id: int, db: Session = Depends(get_db)):
+    """Evakuator/benzin dastavka ish tugatadi: xaritadan yashiriladi (is_online=False)."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+    service.is_online = False
+    db.commit()
+    return {"is_online": False}
+
+@app.put("/api/service-owner/location")
+def service_owner_update_location(owner_id: int, request: LocationUpdateRequest, db: Session = Depends(get_db)):
+    """Ish vaqti davomida joriy joylashuvni davriy yangilab turish uchun."""
+    service = db.query(Service).filter(Service.owner_id == owner_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+    service.current_latitude = request.latitude
+    service.current_longitude = request.longitude
+    service.location_updated_at = func.now()
+    db.commit()
+    return {"success": True, "is_online": service.is_online}
 
 @app.put("/api/admin/services/{service_id}/block")
 def admin_block_service(service_id: int, db: Session = Depends(get_db)):
@@ -2168,9 +2317,65 @@ class NotificationRequest(BaseModel):
 
 @app.post("/api/admin/notifications")
 def admin_send_notification(request: NotificationRequest, db: Session = Depends(get_db)):
-    # Bu yerda real push notification integratsiyasi bo'lishi kerak
-    # Hozircha log qilamiz
-    return {"success": True, "message": f"Bildirishnoma yuborildi: {request.target}", "title": request.title}
+    query = db.query(User)
+    if request.target == "users":
+        query = query.filter(User.role == UserRole.USER.value)
+    elif request.target == "services":
+        query = query.filter(User.role == UserRole.SERVICE_OWNER.value)
+
+    users = query.all()
+    for u in users:
+        create_notification(db, u.id, request.title, request.message, type="admin")
+
+    return {"success": True, "sent_count": len(users), "title": request.title}
+
+# ============================================
+# ILOVA ICHI BILDIRISHNOMALARI (IN-APP)
+# ============================================
+@app.get("/api/notifications")
+def get_notifications(user_id: int, db: Session = Depends(get_db)):
+    notifs = db.query(Notification).filter(Notification.user_id == user_id).order_by(Notification.created_at.desc()).limit(100).all()
+    return [
+        {
+            "id": n.id,
+            "title": n.title,
+            "message": n.message,
+            "type": n.type,
+            "related_id": n.related_id,
+            "is_read": n.is_read,
+            "created_at": n.created_at,
+        }
+        for n in notifs
+    ]
+
+@app.get("/api/notifications/unread-count")
+def get_unread_notifications_count(user_id: int, db: Session = Depends(get_db)):
+    count = db.query(Notification).filter(Notification.user_id == user_id, Notification.is_read == False).count()
+    return {"unread_count": count}
+
+@app.put("/api/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, db: Session = Depends(get_db)):
+    notif = db.query(Notification).filter(Notification.id == notification_id).first()
+    if not notif:
+        raise HTTPException(status_code=404, detail="Bildirishnoma topilmadi")
+    notif.is_read = True
+    db.commit()
+    return {"success": True}
+
+@app.put("/api/notifications/read-all")
+def mark_all_notifications_read(user_id: int, db: Session = Depends(get_db)):
+    db.query(Notification).filter(Notification.user_id == user_id, Notification.is_read == False).update({"is_read": True})
+    db.commit()
+    return {"success": True}
+
+@app.delete("/api/notifications/{notification_id}")
+def delete_notification(notification_id: int, db: Session = Depends(get_db)):
+    notif = db.query(Notification).filter(Notification.id == notification_id).first()
+    if not notif:
+        raise HTTPException(status_code=404, detail="Bildirishnoma topilmadi")
+    db.delete(notif)
+    db.commit()
+    return {"success": True}
 
 if __name__ == "__main__":
     import uvicorn
