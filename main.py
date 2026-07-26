@@ -113,13 +113,16 @@ class Service(Base):
     name = Column(String(200), nullable=False)
     description = Column(Text, nullable=True)
     phone = Column(String(20), nullable=False)
-    address = Column(String(500), nullable=False)
-    latitude = Column(Float, nullable=False)
-    longitude = Column(Float, nullable=False)
-    logo_url = Column(Text, nullable=True)  # stores base64 data-URL, can be very long
+    address = Column(String(500), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    logo_url = Column(Text, nullable=True)  # stores base64 data-URL, can be very long (auto-service uchun logotip, evakuator/benzin uchun mashina rasmi)
     images = Column(Text, nullable=True)  # JSON array of image URLs
     working_hours = Column(String(100), nullable=True)  # e.g., "09:00-18:00"
     day_off = Column(String(50), nullable=True)  # e.g., "Yakshanba"
+    # Evakuator/benzin dastavka uchun: mashina rusmi/turi (masalan "Isuzu evakuator", "Damas sisterna").
+    # auto_service uchun ishlatilmaydi.
+    car_model = Column(String(200), nullable=True)
     rating = Column(Float, default=0.0)
     review_count = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
@@ -354,6 +357,32 @@ def widen_services_offered_category_column():
 widen_services_offered_category_column()
 
 # ============================================
+# ONE-OFF FIX: services.address/latitude/longitude -> NULLABLE
+# ============================================
+# Evakuator va benzin dastavka provayderlari ro'yxatdan o'tishda manzil/xarita
+# nuqtasini kiritmaydi (faqat auto_service uchun majburiy). Ustunlar avval
+# NOT NULL edi - buni bazada ham gevshatish kerak, aks holda evakuator/fuel
+# ro'yxatdan o'tishda NotNullViolation xatosi chiqadi.
+def relax_service_location_columns():
+    import logging
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "services" not in inspector.get_table_names():
+        return
+    columns = {col["name"]: col for col in inspector.get_columns("services")}
+    with engine.begin() as conn:
+        for col_name in ("address", "latitude", "longitude"):
+            col = columns.get(col_name)
+            if col is not None and col.get("nullable") is False:
+                conn.execute(text(f'ALTER TABLE "services" ALTER COLUMN "{col_name}" DROP NOT NULL'))
+                logging.getLogger("uvicorn.error").warning(
+                    f"[auto-migration] relaxed services.{col_name} to NULLABLE"
+                )
+
+relax_service_location_columns()
+
+# ============================================
 # PYDANTIC SCHEMAS
 # ============================================
 class PhoneRequest(BaseModel):
@@ -439,16 +468,18 @@ class ServiceOwnerRegisterRequest(BaseModel):
     first_name: str
     last_name: str
     password: str = Field(..., min_length=6)
-    service_name: str
-    address: str
-    latitude: float
-    longitude: float
+    # auto_service uchun majburiy (servis nomi va manzili). Evakuator/fuel uchun
+    # bular kerak emas - o'rniga car_model va working_hours ishlatiladi.
+    service_name: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     day_off: Optional[str] = None
-    logo_base64: Optional[str] = None  # data-URL or raw base64 of the logo image
+    working_hours: Optional[str] = None  # masalan "09:00-18:00" - evakuator/fuel ro'yxatdan o'tishda kiritiladi
+    logo_base64: Optional[str] = None  # auto_service: servis logotipi. evacuator/fuel: mashina rasmi
+    car_model: Optional[str] = None  # evakuator/fuel uchun: mashina rusmi/turi
     # "auto_service" | "evacuator" | "fuel" - qaysi turdagi provayder sifatida
-    # royxatdan otayotgani. Evakuator va benzin dastavka uchun keyinchalik
-    # oziga xos royxatdan otish maydonlari qoshiladi, hozircha xuddi shu
-    # forma orqali (faqat provider_type belgisi bilan) royxatga olinadi.
+    # royxatdan otayotgani.
     provider_type: str = "auto_service"
 
     @validator('phone')
@@ -828,8 +859,19 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/service-owner/register")
 def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = Depends(get_db)):
-    """Servis egasini ro'yxatdan o'tkazish (telefon OTP orqali oldindan tasdiqlangan bo'lishi kerak).
-    Yaratilgan servis 'pending' holatida bo'ladi va admin tasdig'ini kutadi."""
+    """Servis egasini / evakuator / benzin dastavka provayderini ro'yxatdan o'tkazish
+    (telefon OTP orqali oldindan tasdiqlangan bo'lishi kerak). Yaratilgan servis
+    'pending' holatida bo'ladi va admin tasdig'ini kutadi."""
+
+    if request.provider_type not in ("auto_service", "evacuator", "fuel"):
+        raise HTTPException(status_code=400, detail="Noto'g'ri provider_type")
+
+    if request.provider_type == "auto_service":
+        if not request.service_name or not request.address or request.latitude is None or request.longitude is None:
+            raise HTTPException(status_code=400, detail="Servis nomi va manzil kiritilishi shart")
+    else:
+        if not request.car_model:
+            raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
 
     user = db.query(User).filter(User.phone == request.phone).first()
     full_name = f"{request.first_name} {request.last_name}".strip()
@@ -852,15 +894,21 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
         user.password_hash = hash_password(request.password)
         db.commit()
 
+    # Evakuator/fuel uchun alohida "servis nomi" kiritilmaydi - haydovchi ismi
+    # to'liq nomi sifatida ishlatiladi (masalan mijozga "Evakuator - Bobur Aliyev" kabi ko'rsatish uchun).
+    display_name = request.service_name.strip() if request.service_name else full_name
+
     service = Service(
         owner_id=user.id,
-        name=request.service_name,
+        name=display_name,
         phone=request.phone,
         address=request.address,
         latitude=request.latitude,
         longitude=request.longitude,
         day_off=request.day_off,
+        working_hours=request.working_hours,
         logo_url=request.logo_base64,
+        car_model=request.car_model,
         provider_type=request.provider_type,
         is_active=False,   # admin tasdiqlamaguncha ro'yxatda ko'rinmaydi
         is_verified=False,
@@ -929,6 +977,8 @@ def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
         "day_off": service.day_off,
         "description": service.description,
         "logo_url": service.logo_url,
+        "provider_type": service.provider_type,
+        "car_model": service.car_model,
     }
 
 @app.get("/api/service-owner/orders")
@@ -944,6 +994,25 @@ def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
         .order_by(Order.created_at.desc())
         .all()
     )
+
+    def _car_info(o):
+        # Mijozning asosiy (yoki birinchi) mashinasi - evakuator/benzin dastavka
+        # buyurtma qabul qilishdan oldin mashina turini ko'rishi uchun.
+        if not o.user:
+            return None
+        car = (
+            db.query(Car)
+            .filter(Car.user_id == o.user_id)
+            .order_by(Car.is_primary.desc(), Car.id.desc())
+            .first()
+        )
+        if not car:
+            return None
+        parts = [car.model]
+        if car.color:
+            parts.append(car.color)
+        return " · ".join(p for p in parts if p)
+
     return [
         {
             "id": o.id,
@@ -955,6 +1024,7 @@ def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
             "price": o.price,
             "user_latitude": o.user_latitude,
             "user_longitude": o.user_longitude,
+            "car_info": _car_info(o),
             "created_at": o.created_at,
             "updated_at": o.updated_at,
         }
@@ -1560,7 +1630,7 @@ def get_services(
     result = []
     for s in services:
         distance = None
-        if lat is not None and lng is not None:
+        if lat is not None and lng is not None and s.latitude is not None and s.longitude is not None:
             # Simple Euclidean distance (for production use Haversine)
             distance = ((s.latitude - lat) ** 2 + (s.longitude - lng) ** 2) ** 0.5 * 111  # km approx
 
@@ -1575,7 +1645,10 @@ def get_services(
             "rating": s.rating,
             "review_count": s.review_count,
             "working_hours": s.working_hours,
+            "day_off": s.day_off,
             "provider_type": s.provider_type,
+            "car_model": s.car_model,
+            "logo_url": s.logo_url,
             "distance": round(distance, 2) if distance else None,
             "categories": [o.category for o in s.services_offered if o.is_active and o.status == "approved"]
         })
@@ -1602,7 +1675,9 @@ def get_service_detail(service_id: int, db: Session = Depends(get_db)):
         "rating": service.rating,
         "review_count": service.review_count,
         "working_hours": service.working_hours,
+        "day_off": service.day_off,
         "provider_type": service.provider_type,
+        "car_model": service.car_model,
         "images": service.images,
         # Foydalanuvchiga faqat admin tomonidan tasdiqlangan (approved) xizmatlar
         # ko'rinadi - servis egasi yoki admin qo'shgan va tasdiqlangan xizmatlar.
@@ -1893,6 +1968,7 @@ def admin_get_services(status: Optional[str] = None, provider_type: Optional[str
             "reject_reason": s.reject_reason,
             "rating": s.rating,
             "provider_type": s.provider_type,
+            "car_model": s.car_model,
             "created_at": s.created_at
         }
         for s in services
@@ -2047,6 +2123,8 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
             "review_count": service.review_count,
             "status": service.status,
             "is_active": service.is_active,
+            "provider_type": service.provider_type,
+            "car_model": service.car_model,
         }
     }
 
