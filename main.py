@@ -49,9 +49,7 @@ class UserRole(str, enum.Enum):
 
 class OrderStatus(str, enum.Enum):
     PENDING = "pending"           # 🟡 Kutilmoqda
-    ACCEPTED = "accepted"         # 🔵 Qabul qilindi
-    ON_WAY = "on_way"            # 🟠 Yo'lda
-    ARRIVED = "arrived"          # 🟢 Yetib keldi
+    ACCEPTED = "accepted"         # 🔵 Qabul qilindi (mijoz o'zi servisga boradi)
     COMPLETED = "completed"      # ✅ Yakunlandi
     CANCELLED = "cancelled"      # ❌ Bekor qilindi
 
@@ -123,6 +121,10 @@ class Service(Base):
     # Evakuator/benzin dastavka uchun: mashina rusmi/turi (masalan "Isuzu evakuator", "Damas sisterna").
     # auto_service uchun ishlatilmaydi.
     car_model = Column(String(200), nullable=True)
+    # Evakuator/benzin dastavka uchun: xizmat narxi - FAQAT admin belgilaydi
+    # (auto_service uchun ishlatilmaydi, chunki uning narxlari ServiceType/
+    # ServiceOffered orqali kategoriyalar bo'yicha belgilanadi).
+    price = Column(Float, nullable=True)
     rating = Column(Float, default=0.0)
     review_count = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
@@ -527,6 +529,7 @@ class ServiceEditRequest(BaseModel):
     day_off: Optional[str] = None
     working_hours: Optional[str] = None
     car_model: Optional[str] = None  # evakuator/fuel uchun: mashina rusmi/turi
+    price: Optional[float] = None  # evakuator/fuel uchun: xizmat narxi - admin belgilaydi
     logo_base64: Optional[str] = None
 
 class LocationUpdateRequest(BaseModel):
@@ -795,8 +798,6 @@ def create_notification(db: Session, user_id: int, title: str, message: str, typ
 ORDER_STATUS_LABELS = {
     "pending": "Kutilmoqda",
     "accepted": "Qabul qilindi",
-    "on_way": "Yo'lda",
-    "arrived": "Yetib keldi",
     "completed": "Yakunlandi",
     "cancelled": "Bekor qilindi",
 }
@@ -1439,7 +1440,7 @@ def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
 
     orders = db.query(Order).filter(Order.service_id == service.id).all()
     today = datetime.datetime.now(datetime.timezone.utc).date()
-    active_statuses = {"pending", "accepted", "on_way", "arrived"}
+    active_statuses = {"pending", "accepted"}
 
     today_count = sum(1 for o in orders if o.created_at and o.created_at.date() == today)
     active_count = sum(1 for o in orders if o.status in active_statuses)
@@ -1724,6 +1725,7 @@ def get_services(
             "day_off": s.day_off,
             "provider_type": s.provider_type,
             "car_model": s.car_model,
+            "price": s.price,
             "logo_url": s.logo_url,
             "is_online": s.is_online,
             "distance": round(distance, 2) if distance else None,
@@ -1755,6 +1757,7 @@ def get_service_detail(service_id: int, db: Session = Depends(get_db)):
         "day_off": service.day_off,
         "provider_type": service.provider_type,
         "car_model": service.car_model,
+        "price": service.price,
         "is_online": service.is_online,
         "images": service.images,
         # Foydalanuvchiga faqat admin tomonidan tasdiqlangan (approved) xizmatlar
@@ -1986,7 +1989,7 @@ def get_favorites(user_id: int, db: Session = Depends(get_db)):
 def admin_dashboard(db: Session = Depends(get_db)):
     total_users = db.query(User).count()
     total_services = db.query(Service).count()
-    active_orders = db.query(Order).filter(Order.status.in_(["pending", "accepted", "on_way", "arrived"])).count()
+    active_orders = db.query(Order).filter(Order.status.in_(["pending", "accepted"])).count()
     today_orders = db.query(Order).filter(
         func.date(Order.created_at) == func.date(func.now())
     ).count()
@@ -2016,6 +2019,61 @@ def admin_get_users(db: Session = Depends(get_db)):
         for u in users
     ]
 
+@app.get("/api/admin/users/{user_id}")
+def admin_get_user_detail(user_id: int, db: Session = Depends(get_db)):
+    """Admin panelida foydalanuvchilar ro'yxatidan bittasini bosganda uning
+    barcha ma'lumotlarini (mashinalari, buyurtmalari, agar servis egasi bo'lsa
+    - o'z servisi) ko'rsatish uchun."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+
+    own_service = db.query(Service).filter(Service.owner_id == user.id).first()
+
+    return {
+        "id": user.id,
+        "name": user.name,
+        "phone": user.phone,
+        "city": user.city,
+        "role": user.role,
+        "is_active": user.is_active,
+        "created_at": user.created_at,
+        "cars": [
+            {
+                "id": c.id,
+                "model": c.model,
+                "plate_number": c.plate_number,
+                "year": c.year,
+                "color": c.color,
+                "fuel_type": c.fuel_type,
+                "is_primary": c.is_primary,
+            }
+            for c in user.cars
+        ],
+        "orders": [
+            {
+                "id": o.id,
+                "service_name": o.service.name if o.service else None,
+                "category": o.category,
+                "status": o.status,
+                "price": o.price,
+                "created_at": o.created_at,
+            }
+            for o in sorted(user.orders, key=lambda o: o.created_at or datetime.datetime.min, reverse=True)
+        ],
+        "favorite_count": len(user.favorites),
+        "review_count": len(user.reviews),
+        "own_service": (
+            {
+                "id": own_service.id,
+                "name": own_service.name,
+                "provider_type": own_service.provider_type,
+                "status": own_service.status,
+            }
+            if own_service else None
+        ),
+    }
+
 @app.put("/api/admin/users/{user_id}/block")
 def admin_block_user(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
@@ -2026,8 +2084,16 @@ def admin_block_user(user_id: int, db: Session = Depends(get_db)):
     return {"id": user.id, "is_active": user.is_active}
 
 @app.get("/api/admin/orders")
-def admin_get_orders(status: Optional[str] = None, db: Session = Depends(get_db)):
+def admin_get_orders(status: Optional[str] = None, scope: Optional[str] = None, db: Session = Depends(get_db)):
+    """status: aniq bitta holat ('pending' | 'accepted' | 'completed' | 'cancelled').
+    scope: dashboard statistik kartalari uchun qulay filtrlar -
+      'active' -> 'Faol buyurtmalar' kartasi bilan bir xil (pending + accepted),
+      'today'  -> 'Bugungi buyurtmalar' kartasi bilan bir xil (bugun yaratilganlar)."""
     query = db.query(Order)
+    if scope == "active":
+        query = query.filter(Order.status.in_(["pending", "accepted"]))
+    elif scope == "today":
+        query = query.filter(func.date(Order.created_at) == func.date(func.now()))
     if status:
         query = query.filter(Order.status == status)
     orders = query.order_by(Order.created_at.desc()).all()
@@ -2038,10 +2104,43 @@ def admin_get_orders(status: Optional[str] = None, db: Session = Depends(get_db)
             "service_name": o.service.name,
             "category": o.category,
             "status": o.status,
+            "price": o.price,
             "created_at": o.created_at
         }
         for o in orders
     ]
+
+@app.get("/api/admin/orders/{order_id}")
+def admin_get_order_detail(order_id: int, db: Session = Depends(get_db)):
+    """Admin panelida buyurtmalar ro'yxatidan bittasini bosganda uning barcha
+    ma'lumotlarini (mijoz, servis, narx, holat) ko'rsatish uchun."""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Buyurtma topilmadi")
+
+    return {
+        "id": order.id,
+        "user": {
+            "id": order.user.id,
+            "name": order.user.name,
+            "phone": order.user.phone,
+        } if order.user else None,
+        "service": {
+            "id": order.service.id,
+            "name": order.service.name,
+            "phone": order.service.phone,
+            "provider_type": order.service.provider_type,
+        } if order.service else None,
+        "category": order.category,
+        "status": order.status,
+        "description": order.description,
+        "user_latitude": order.user_latitude,
+        "user_longitude": order.user_longitude,
+        "price": order.price,
+        "created_at": order.created_at,
+        "updated_at": order.updated_at,
+        "completed_at": order.completed_at,
+    }
 
 @app.get("/api/admin/services")
 def admin_get_services(status: Optional[str] = None, provider_type: Optional[str] = None, db: Session = Depends(get_db)):
@@ -2073,6 +2172,7 @@ def admin_get_services(status: Optional[str] = None, provider_type: Optional[str
             "rating": s.rating,
             "provider_type": s.provider_type,
             "car_model": s.car_model,
+            "price": s.price,
             "is_online": s.is_online,
             "current_latitude": s.current_latitude,
             "current_longitude": s.current_longitude,
@@ -2130,6 +2230,8 @@ def admin_edit_service(service_id: int, request: ServiceEditRequest, db: Session
         service.working_hours = request.working_hours
     if request.car_model is not None:
         service.car_model = request.car_model
+    if request.price is not None:
+        service.price = request.price
     if request.logo_base64 is not None:
         service.logo_url = request.logo_base64
     if request.owner_name is not None and service.owner is not None:
