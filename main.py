@@ -229,6 +229,13 @@ class Order(Base):
     # so'ragan benzin miqdori (litr). Narx shundan kelib chiqib hisoblanadi:
     # price = fuel_delivery_fee + liters * fuel_price_per_liter.
     liters = Column(Float, nullable=True)
+    # "now" - mijoz hozir servisga o'zi boradi/chaqiradi (darhol xizmat).
+    # "scheduled" - mijoz kelajakdagi sana/vaqtga bron qilyapti.
+    # Faqat auto_service (oddiy avtoservis) buyurtmalari uchun ma'noga ega -
+    # evakuator/benzin dastavka har doim "now" bo'ladi.
+    order_type = Column(String(20), default="now", nullable=False)
+    # order_type == "scheduled" bo'lganda mijoz tanlagan sana va vaqt.
+    scheduled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -650,6 +657,28 @@ class OrderCreate(BaseModel):
     # Faqat category == "fuel" (benzin dastavka) uchun: nechi litr kerakligi.
     # Narx shu asosda avtomatik hisoblanadi (global narxlar sozlamalaridan).
     liters: Optional[float] = None
+    # "now" (hozir borish) yoki "scheduled" (bron qilish).
+    order_type: str = "now"
+    # order_type == "scheduled" bo'lganda majburiy - ISO 8601 format
+    # (masalan "2026-08-01T14:00:00").
+    scheduled_at: Optional[datetime.datetime] = None
+
+    @validator("order_type")
+    def validate_order_type(cls, v):
+        if v not in ("now", "scheduled"):
+            raise ValueError("order_type faqat 'now' yoki 'scheduled' bo'lishi mumkin")
+        return v
+
+    @validator("scheduled_at", always=True)
+    def validate_scheduled_at(cls, v, values):
+        order_type = values.get("order_type", "now")
+        if order_type == "scheduled":
+            if v is None:
+                raise ValueError("Bron qilish uchun sana va vaqtni tanlang")
+            now = datetime.datetime.now(v.tzinfo) if v.tzinfo else datetime.datetime.now()
+            if v <= now:
+                raise ValueError("Bron vaqti kelajakda bo'lishi kerak")
+        return v
 
 class PricingUpdate(BaseModel):
     evacuator_price: Optional[float] = None
@@ -1133,6 +1162,8 @@ def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
             "description": o.description,
             "status": o.status,
             "price": o.price,
+            "order_type": o.order_type,
+            "scheduled_at": o.scheduled_at,
             "user_latitude": o.user_latitude,
             "user_longitude": o.user_longitude,
             "car_info": _car_info(o),
@@ -1819,6 +1850,65 @@ def get_service_detail(service_id: int, db: Session = Depends(get_db)):
     }
 
 # ============================================
+# BRON VAQTINI SERVIS ISH VAQTI/DAM OLISH KUNIGA TEKSHIRISH
+# ============================================
+# Frontend'dagi isAutoServiceOpenNow() bilan bir xil format va mantiq:
+# - day_off: "Yakshanba" kabi hafta kuni nomi (yoki "Dam olish kuni yo'q" /
+#   bo'sh - cheklov yo'q)
+# - working_hours: "09:00-18:00" formatida. Agar boshlanish tugashdan
+#   katta bo'lsa (masalan "22:00-06:00"), bu tungi smena deb hisoblanadi.
+_WEEKDAY_NAMES_UZ = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
+
+
+def _validate_scheduled_within_service_hours(service: "Service", scheduled_at: datetime.datetime) -> None:
+    day_off = (service.day_off or "").strip()
+    if day_off and day_off != "Dam olish kuni yo'q":
+        if _WEEKDAY_NAMES_UZ[scheduled_at.weekday()] == day_off:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Bu servis {day_off} kunlari dam oladi, shu kunga bron qilib bo'lmaydi",
+            )
+
+    working_hours = (service.working_hours or "").strip()
+    if not working_hours or "-" not in working_hours:
+        return  # ish vaqti belgilanmagan - cheklamaymiz
+
+    parts = working_hours.split("-")
+    if len(parts) != 2:
+        return
+
+    def _parse_hm(s: str):
+        s = s.strip()
+        hm = s.split(":")
+        if len(hm) != 2:
+            return None
+        try:
+            return int(hm[0]), int(hm[1])
+        except ValueError:
+            return None
+
+    start = _parse_hm(parts[0])
+    end = _parse_hm(parts[1])
+    if start is None or end is None:
+        return
+
+    scheduled_min = scheduled_at.hour * 60 + scheduled_at.minute
+    start_min = start[0] * 60 + start[1]
+    end_min = end[0] * 60 + end[1]
+
+    if start_min <= end_min:
+        in_hours = start_min <= scheduled_min < end_min
+    else:
+        in_hours = scheduled_min >= start_min or scheduled_min < end_min  # tungi smena
+
+    if not in_hours:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Bu servis ish vaqti {working_hours}, shu vaqt oralig'ida bron qiling",
+        )
+
+
+# ============================================
 # ORDER ENDPOINTS
 # ============================================
 @app.post("/api/orders")
@@ -1849,6 +1939,21 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
         liters = order.liters
         computed_price = delivery_fee + liters * price_per_liter
 
+    # Evakuator/benzin dastavka - har doim "hozir" turidagi chaqiruv,
+    # bron qilib bo'lmaydi (mijoz frontend orqali order_type yubormasa ham
+    # xavfsizlik uchun bu yerda majburlab qo'yiladi).
+    order_type = order.order_type
+    scheduled_at = order.scheduled_at
+    if service.provider_type in ("evacuator", "fuel"):
+        order_type = "now"
+        scheduled_at = None
+
+    # Bron qilinayotgan vaqt servisning dam olish kuniga yoki ish vaqtidan
+    # tashqariga to'g'ri kelmasligini tekshiramiz (faqat oddiy avtoservis
+    # uchun - evakuator/benzin yuqorida allaqachon "now"ga majburlangan).
+    if order_type == "scheduled" and scheduled_at:
+        _validate_scheduled_within_service_hours(service, scheduled_at)
+
     new_order = Order(
         user_id=user_id,
         service_id=order.service_id,
@@ -1858,22 +1963,30 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
         user_longitude=order.user_longitude,
         price=computed_price,
         liters=liters,
+        order_type=order_type,
+        scheduled_at=scheduled_at,
         status=OrderStatus.PENDING.value
     )
     db.add(new_order)
     db.commit()
     db.refresh(new_order)
 
+    notif_text = f"{user.name} sizga yangi buyurtma berdi: {service.name}"
+    if order_type == "scheduled" and scheduled_at:
+        notif_text = f"{user.name} sizga bron qildi ({scheduled_at.strftime('%d.%m.%Y %H:%M')}): {service.name}"
+
     create_notification(
         db, service.owner_id,
         "Yangi buyurtma",
-        f"{user.name} sizga yangi buyurtma berdi: {service.name}",
+        notif_text,
         type="new_order", related_id=new_order.id,
     )
 
     return {
         "id": new_order.id,
         "status": new_order.status,
+        "order_type": new_order.order_type,
+        "scheduled_at": new_order.scheduled_at,
         "service_name": service.name,
         "created_at": new_order.created_at
     }
@@ -1888,6 +2001,8 @@ def get_user_orders(user_id: int, db: Session = Depends(get_db)):
             "category": o.category,
             "status": o.status,
             "price": o.price,
+            "order_type": o.order_type,
+            "scheduled_at": o.scheduled_at,
             "created_at": o.created_at,
             "updated_at": o.updated_at
         }
@@ -1928,6 +2043,8 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
         },
         "category": order.category,
         "status": order.status,
+        "order_type": order.order_type,
+        "scheduled_at": order.scheduled_at,
         "description": order.description,
         "user_latitude": order.user_latitude,
         "user_longitude": order.user_longitude,
@@ -2188,6 +2305,8 @@ def admin_get_orders(status: Optional[str] = None, scope: Optional[str] = None, 
             "category": o.category,
             "status": o.status,
             "price": o.price,
+            "order_type": o.order_type,
+            "scheduled_at": o.scheduled_at,
             "created_at": o.created_at
         }
         for o in orders
@@ -2216,6 +2335,8 @@ def admin_get_order_detail(order_id: int, db: Session = Depends(get_db)):
         } if order.service else None,
         "category": order.category,
         "status": order.status,
+        "order_type": order.order_type,
+        "scheduled_at": order.scheduled_at,
         "description": order.description,
         "user_latitude": order.user_latitude,
         "user_longitude": order.user_longitude,
