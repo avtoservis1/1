@@ -196,6 +196,23 @@ class ServiceOffered(Base):
     service = relationship("Service", back_populates="services_offered")
     service_type = relationship("ServiceType", back_populates="services_offered")
 
+class PricingSettings(Base):
+    """
+    Evakuator va benzin dastavka uchun GLOBAL narxlar - har bir alohida
+    provayder emas, balki admin panelidan bitta joyda butun tizim uchun
+    belgilanadi. Har doim yagona qator (id=1) sifatida saqlanadi.
+    - evacuator_price: evakuator chaqirish uchun belgilangan narx (so'm).
+    - fuel_delivery_fee: benzin yetkazib berish xizmati uchun narx (so'm).
+    - fuel_price_per_liter: benzinning har bir litri uchun narx (so'm/litr).
+    """
+    __tablename__ = "pricing_settings"
+
+    id = Column(Integer, primary_key=True, default=1)
+    evacuator_price = Column(Float, default=0)
+    fuel_delivery_fee = Column(Float, default=120000)
+    fuel_price_per_liter = Column(Float, default=16000)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
 class Order(Base):
     __tablename__ = "orders"
 
@@ -208,6 +225,10 @@ class Order(Base):
     user_latitude = Column(Float, nullable=True)
     user_longitude = Column(Float, nullable=True)
     price = Column(Float, nullable=True)
+    # Faqat benzin dastavka (category == "fuel") buyurtmalari uchun: mijoz
+    # so'ragan benzin miqdori (litr). Narx shundan kelib chiqib hisoblanadi:
+    # price = fuel_delivery_fee + liters * fuel_price_per_liter.
+    liters = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -385,6 +406,22 @@ def widen_services_offered_category_column():
         )
 
 widen_services_offered_category_column()
+
+# ============================================
+# SEED: evakuator/benzin dastavka uchun global narxlar (bitta qator)
+# ============================================
+def seed_pricing_settings():
+    from sqlalchemy.orm import Session as _Session
+    db = _Session(bind=engine)
+    try:
+        existing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
+        if existing is None:
+            db.add(PricingSettings(id=1, evacuator_price=0, fuel_delivery_fee=120000, fuel_price_per_liter=16000))
+            db.commit()
+    finally:
+        db.close()
+
+seed_pricing_settings()
 
 # ============================================
 # ONE-OFF FIX: services.address/latitude/longitude -> NULLABLE
@@ -610,6 +647,14 @@ class OrderCreate(BaseModel):
     description: Optional[str] = None
     user_latitude: Optional[float] = None
     user_longitude: Optional[float] = None
+    # Faqat category == "fuel" (benzin dastavka) uchun: nechi litr kerakligi.
+    # Narx shu asosda avtomatik hisoblanadi (global narxlar sozlamalaridan).
+    liters: Optional[float] = None
+
+class PricingUpdate(BaseModel):
+    evacuator_price: Optional[float] = None
+    fuel_delivery_fee: Optional[float] = None
+    fuel_price_per_liter: Optional[float] = None
 
 class OrderStatusUpdate(BaseModel):
     status: str
@@ -1786,6 +1831,24 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
+    # Evakuator va benzin dastavka uchun narx mijoz yoki servis egasi tomonidan
+    # emas, balki admin panelida belgilangan GLOBAL narxlardan avtomatik
+    # hisoblanadi - shuning uchun bu yerda qayta hisoblanadi (frontenddan
+    # kelgan narxga ishonilmaydi).
+    computed_price = None
+    liters = None
+    if service.provider_type == "evacuator":
+        pricing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
+        computed_price = pricing.evacuator_price if pricing else None
+    elif service.provider_type == "fuel":
+        if order.liters is None or order.liters <= 0:
+            raise HTTPException(status_code=400, detail="Benzin miqdorini (litr) kiriting")
+        pricing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
+        delivery_fee = pricing.fuel_delivery_fee if pricing else 0
+        price_per_liter = pricing.fuel_price_per_liter if pricing else 0
+        liters = order.liters
+        computed_price = delivery_fee + liters * price_per_liter
+
     new_order = Order(
         user_id=user_id,
         service_id=order.service_id,
@@ -1793,6 +1856,8 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
         description=order.description,
         user_latitude=order.user_latitude,
         user_longitude=order.user_longitude,
+        price=computed_price,
+        liters=liters,
         status=OrderStatus.PENDING.value
     )
     db.add(new_order)
@@ -1835,6 +1900,21 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
     if not order:
         raise HTTPException(status_code=404, detail="Buyurtma topilmadi")
 
+    # Evakuator/benzin dastavka qabul qilingandan so'ng haydovchining jonli
+    # joylashuvi (agar u ish ustida joylashuvini yuborib turgan bo'lsa) -
+    # MapTrackingScreen va OrderDetailScreen shu maydonni kutadi.
+    driver_location = None
+    if (
+        order.service.provider_type in ("evacuator", "fuel")
+        and order.status == OrderStatus.ACCEPTED.value
+        and order.service.current_latitude is not None
+        and order.service.current_longitude is not None
+    ):
+        driver_location = {
+            "lat": order.service.current_latitude,
+            "lng": order.service.current_longitude,
+        }
+
     return {
         "id": order.id,
         "service": {
@@ -1844,6 +1924,7 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
             "address": order.service.address,
             "latitude": order.service.latitude,
             "longitude": order.service.longitude,
+            "provider_type": order.service.provider_type,
         },
         "category": order.category,
         "status": order.status,
@@ -1851,6 +1932,8 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
         "user_latitude": order.user_latitude,
         "user_longitude": order.user_longitude,
         "price": order.price,
+        "liters": order.liters,
+        "driver_location": driver_location,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
         "chat_messages": [
@@ -2400,6 +2483,48 @@ def get_categories(db: Session = Depends(get_db)):
     for t in types:
         result.append({"id": str(t.id), "name": t.name, "icon": t.icon or "build", "price": t.price})
     return result
+
+# ---- Evakuator/benzin dastavka uchun GLOBAL narxlar ----
+def _get_or_create_pricing(db: Session) -> PricingSettings:
+    pricing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
+    if pricing is None:
+        pricing = PricingSettings(id=1, evacuator_price=0, fuel_delivery_fee=120000, fuel_price_per_liter=16000)
+        db.add(pricing)
+        db.commit()
+        db.refresh(pricing)
+    return pricing
+
+@app.get("/api/pricing")
+def get_pricing(db: Session = Depends(get_db)):
+    """
+    Evakuator va benzin dastavka narxlari - foydalanuvchi ilovasi "Chaqirish"
+    dan oldin narxni shu yerdan olib ko'rsatadi. Ushbu narxlarni FAQAT admin
+    o'zgartira oladi (/api/admin/pricing orqali).
+    """
+    pricing = _get_or_create_pricing(db)
+    return {
+        "evacuator_price": pricing.evacuator_price,
+        "fuel_delivery_fee": pricing.fuel_delivery_fee,
+        "fuel_price_per_liter": pricing.fuel_price_per_liter,
+    }
+
+@app.put("/api/admin/pricing")
+def admin_update_pricing(request: PricingUpdate, db: Session = Depends(get_db)):
+    """Admin panel: evakuator va benzin dastavka uchun global narxlarni belgilash."""
+    pricing = _get_or_create_pricing(db)
+    if request.evacuator_price is not None:
+        pricing.evacuator_price = request.evacuator_price
+    if request.fuel_delivery_fee is not None:
+        pricing.fuel_delivery_fee = request.fuel_delivery_fee
+    if request.fuel_price_per_liter is not None:
+        pricing.fuel_price_per_liter = request.fuel_price_per_liter
+    db.commit()
+    db.refresh(pricing)
+    return {
+        "evacuator_price": pricing.evacuator_price,
+        "fuel_delivery_fee": pricing.fuel_delivery_fee,
+        "fuel_price_per_liter": pricing.fuel_price_per_liter,
+    }
 
 # ---- Admin: foydalanuvchini bloklash ----
 @app.put("/api/admin/users/{user_id}/role")
