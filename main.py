@@ -696,6 +696,13 @@ class LocationUpdateRequest(BaseModel):
 class ServiceRejectRequest(BaseModel):
     reason: Optional[str] = None
 
+class OrderEditRequest(BaseModel):
+    """Admin panelidan buyurtmani tahrirlash: holati, narxi yoki izohini
+    o'zgartirish uchun."""
+    status: Optional[str] = None
+    price: Optional[float] = None
+    description: Optional[str] = None
+
 class ServiceOwnerProfileUpdate(BaseModel):
     """Servis egasi 'Profil' bo'limidan o'zi to'ldiradigan maydonlar."""
     name: Optional[str] = None
@@ -2465,6 +2472,41 @@ def admin_get_order_detail(order_id: int, db: Session = Depends(get_db)):
         "completed_at": order.completed_at,
     }
 
+@app.put("/api/admin/orders/{order_id}/edit")
+def admin_edit_order(order_id: int, request: OrderEditRequest, db: Session = Depends(get_db)):
+    """✏️ Tahrirlash — admin buyurtma holati/narxi/izohini o'zgartirishi mumkin."""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Buyurtma topilmadi")
+
+    if request.status is not None:
+        valid_statuses = ["pending", "accepted", "completed", "cancelled"]
+        if request.status not in valid_statuses:
+            raise HTTPException(status_code=400, detail="Noto'g'ri holat qiymati")
+        order.status = request.status
+        if request.status == "completed" and order.completed_at is None:
+            order.completed_at = func.now()
+    if request.price is not None:
+        order.price = request.price
+    if request.description is not None:
+        order.description = request.description
+
+    db.commit()
+    db.refresh(order)
+    return {"id": order.id, "status": order.status, "price": order.price, "message": "Buyurtma yangilandi"}
+
+@app.delete("/api/admin/orders/{order_id}")
+def admin_delete_order(order_id: int, db: Session = Depends(get_db)):
+    """🗑️ O'chirish — buyurtmani va unga bog'liq chat/sharh yozuvlarini o'chiradi."""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Buyurtma topilmadi")
+    db.query(ChatMessage).filter(ChatMessage.order_id == order_id).delete()
+    db.query(Review).filter(Review.order_id == order_id).delete()
+    db.delete(order)
+    db.commit()
+    return {"success": True, "message": "Buyurtma o'chirildi"}
+
 @app.get("/api/admin/services")
 def admin_get_services(status: Optional[str] = None, provider_type: Optional[str] = None, db: Session = Depends(get_db)):
     """status: 'pending' | 'approved' | 'rejected' | None (hammasi)
@@ -2608,6 +2650,167 @@ def admin_block_service(service_id: int, db: Session = Depends(get_db)):
     service.is_active = not service.is_active
     db.commit()
     return {"id": service.id, "is_active": service.is_active}
+
+@app.delete("/api/admin/services/{service_id}")
+def admin_delete_service(service_id: int, db: Session = Depends(get_db)):
+    """🗑️ O'chirish — servisni va unga bog'liq barcha yozuvlarni (buyurtmalar,
+    xizmatlar, sharhlar, sevimlilar) butunlay o'chiradi."""
+    service = db.query(Service).filter(Service.id == service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+
+    order_ids = [o.id for o in db.query(Order).filter(Order.service_id == service_id).all()]
+    if order_ids:
+        db.query(ChatMessage).filter(ChatMessage.order_id.in_(order_ids)).delete(synchronize_session=False)
+        db.query(Review).filter(Review.order_id.in_(order_ids)).delete(synchronize_session=False)
+        db.query(Order).filter(Order.service_id == service_id).delete(synchronize_session=False)
+    db.query(ServiceOffered).filter(ServiceOffered.service_id == service_id).delete(synchronize_session=False)
+    db.query(Review).filter(Review.service_id == service_id).delete(synchronize_session=False)
+    db.query(Favorite).filter(Favorite.service_id == service_id).delete(synchronize_session=False)
+
+    db.delete(service)
+    db.commit()
+    return {"success": True, "message": "Servis o'chirildi"}
+
+@app.get("/api/admin/map")
+def admin_map_data(db: Session = Depends(get_db)):
+    """Admin panelidagi 'Xarita' bo'limi uchun: barcha (koordinatasi bor)
+    servislar, hozir faol (pending/accepted) buyurtmalar, va joriy jonli
+    joylashuvi bor faol ustalar (online evakuator/benzin dastavka)."""
+    services = db.query(Service).filter(
+        Service.status == "approved",
+        Service.latitude.isnot(None),
+        Service.longitude.isnot(None),
+    ).all()
+
+    active_orders = db.query(Order).filter(
+        Order.status.in_(["pending", "accepted"]),
+        Order.user_latitude.isnot(None),
+        Order.user_longitude.isnot(None),
+    ).all()
+
+    active_workers = db.query(Service).filter(
+        Service.provider_type.in_(["evacuator", "fuel"]),
+        Service.is_online == True,
+        Service.current_latitude.isnot(None),
+        Service.current_longitude.isnot(None),
+    ).all()
+
+    return {
+        "services": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "provider_type": s.provider_type,
+                "latitude": s.latitude,
+                "longitude": s.longitude,
+                "address": display_service_address(s),
+                "is_active": s.is_active,
+            }
+            for s in services
+        ],
+        "orders": [
+            {
+                "id": o.id,
+                "category": o.category,
+                "status": o.status,
+                "latitude": o.user_latitude,
+                "longitude": o.user_longitude,
+                "user_name": o.user.name if o.user else None,
+                "service_name": o.service.name if o.service else None,
+            }
+            for o in active_orders
+        ],
+        "active_workers": [
+            {
+                "id": w.id,
+                "name": w.name,
+                "provider_type": w.provider_type,
+                "latitude": w.current_latitude,
+                "longitude": w.current_longitude,
+                "current_address": w.current_address,
+            }
+            for w in active_workers
+        ],
+    }
+
+@app.get("/api/admin/statistics")
+def admin_statistics(db: Session = Depends(get_db)):
+    """Admin panelidagi 'Statistika' bo'limi uchun: kunlik/haftalik/oylik
+    buyurtmalar dinamikasi, eng mashhur xizmat turi va eng faol servis."""
+    now = datetime.datetime.utcnow()
+
+    # ---- Kunlik (oxirgi 7 kun) ----
+    daily = []
+    for i in range(6, -1, -1):
+        day = (now - datetime.timedelta(days=i)).date()
+        day_orders = db.query(Order).filter(func.date(Order.created_at) == day).all()
+        revenue = sum(o.price or 0 for o in day_orders if o.status == "completed")
+        daily.append({
+            "label": day.strftime("%d.%m"),
+            "count": len(day_orders),
+            "revenue": revenue,
+        })
+
+    # ---- Haftalik (oxirgi 6 hafta) ----
+    weekly = []
+    for i in range(5, -1, -1):
+        week_end = now - datetime.timedelta(days=7 * i)
+        week_start = week_end - datetime.timedelta(days=6)
+        week_orders = db.query(Order).filter(
+            func.date(Order.created_at) >= week_start.date(),
+            func.date(Order.created_at) <= week_end.date(),
+        ).all()
+        revenue = sum(o.price or 0 for o in week_orders if o.status == "completed")
+        weekly.append({
+            "label": f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m')}",
+            "count": len(week_orders),
+            "revenue": revenue,
+        })
+
+    # ---- Oylik (oxirgi 6 oy) ----
+    monthly = []
+    month_names = ["Yan", "Fev", "Mar", "Apr", "May", "Iyun", "Iyul", "Avg", "Sen", "Okt", "Noy", "Dek"]
+    for i in range(5, -1, -1):
+        # Compute target month by stepping back i months from current month
+        year = now.year
+        month = now.month - i
+        while month <= 0:
+            month += 12
+            year -= 1
+        month_orders = db.query(Order).filter(
+            func.extract("year", Order.created_at) == year,
+            func.extract("month", Order.created_at) == month,
+        ).all()
+        revenue = sum(o.price or 0 for o in month_orders if o.status == "completed")
+        monthly.append({
+            "label": f"{month_names[month - 1]} {year}",
+            "count": len(month_orders),
+            "revenue": revenue,
+        })
+
+    # ---- Eng mashhur xizmat (category bo'yicha eng ko'p buyurtma) ----
+    popular = db.query(Order.category, func.count(Order.id).label("cnt")) \
+        .group_by(Order.category).order_by(func.count(Order.id).desc()).first()
+    most_popular_service = {"category": popular[0], "count": popular[1]} if popular else None
+
+    # ---- Eng faol servis (eng ko'p buyurtma qabul qilgan servis) ----
+    active_service = db.query(Service, func.count(Order.id).label("cnt")) \
+        .join(Order, Order.service_id == Service.id) \
+        .group_by(Service.id).order_by(func.count(Order.id).desc()).first()
+    most_active_service = {
+        "id": active_service[0].id,
+        "name": active_service[0].name,
+        "count": active_service[1],
+    } if active_service else None
+
+    return {
+        "daily": daily,
+        "weekly": weekly,
+        "monthly": monthly,
+        "most_popular_service": most_popular_service,
+        "most_active_service": most_active_service,
+    }
 
 # ============================================
 # HEALTH CHECK
