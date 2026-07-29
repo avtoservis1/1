@@ -142,6 +142,12 @@ class Service(Base):
     is_online = Column(Boolean, default=False)
     current_latitude = Column(Float, nullable=True)
     current_longitude = Column(Float, nullable=True)
+    # Evakuator/benzin dastavka uchun: jonli joylashuv (current_latitude/
+    # current_longitude) asosida avtomatik aniqlangan "Viloyat, Tuman" matni.
+    # Bu haydovchi/dastavkachining STATIK `address` maydoni doim bo'sh
+    # (registratsiyada kiritilmaydi) bo'lgani uchun, mijozga "manzil"
+    # o'rniga shu ustun ko'rsatiladi - real vaqtda qayerda ekanini bildiradi.
+    current_address = Column(String(500), nullable=True)
     location_updated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -455,6 +461,113 @@ def relax_service_location_columns():
                 )
 
 relax_service_location_columns()
+
+# ============================================
+# ONE-OFF FIX: services.current_address ustunini qo'shish
+# ============================================
+# Eski bazalarda bu ustun mavjud emas (yangi qo'shildi) - agar mavjud
+# bo'lmasa, qo'shamiz. Ustun bo'sh (nullable) bo'lgani uchun bu xavfsiz.
+def add_current_address_column():
+    import logging
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "services" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("services")}
+    if "current_address" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text('ALTER TABLE "services" ADD COLUMN "current_address" VARCHAR(500)'))
+        logging.getLogger("uvicorn.error").warning(
+            "[auto-migration] qo'shildi: services.current_address"
+        )
+
+add_current_address_column()
+
+# ============================================
+# JONLI JOYLASHUVNI MANZILGA (Viloyat, Tuman) AYLANTIRISH
+# ============================================
+# Evakuator/benzin dastavka haydovchisining koordinatalarini (lat/lng)
+# odam o'qiy oladigan "Viloyat, Tuman" ko'rinishiga o'giradi - xuddi
+# Flutter tomonidagi reverseGeocode() funksiyasi kabi, faqat backend
+# tomonida (shunda bir marta hisoblanib, barcha mijozlarga bir xil,
+# tayyor holda yuboriladi). Nominatim (OpenStreetMap) bepul xizmatidan
+# foydalaniladi. Xato/tarmoq muammosi bo'lsa, jim None qaytaradi - hech
+# qachon so'rovni butunlay buzmaydi.
+def reverse_geocode_region_district(lat: float, lng: float) -> Optional[str]:
+    try:
+        resp = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={
+                "format": "json",
+                "lat": lat,
+                "lon": lng,
+                "zoom": 12,
+                "addressdetails": 1,
+                "accept-language": "uz",
+            },
+            headers={"User-Agent": "avtoservis-backend"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        addr = data.get("address") or {}
+        region = addr.get("state") or addr.get("region") or addr.get("city")
+        district = (
+            addr.get("county")
+            or addr.get("city_district")
+            or addr.get("town")
+            or addr.get("municipality")
+            or addr.get("suburb")
+        )
+        if region and district and district != region:
+            return f"{region}, {district}"
+        return region or district or data.get("display_name")
+    except Exception:
+        return None
+
+
+def _approx_distance_meters(lat1, lng1, lat2, lng2) -> float:
+    """Ikki nuqta orasidagi taxminiy masofa (metr) - faqat qachon manzilni
+    qayta hisoblash kerakligini aniqlash uchun ishlatiladi, aniq masofa
+    hisob-kitobi uchun emas."""
+    return ((lat1 - lat2) ** 2 + (lng1 - lng2) ** 2) ** 0.5 * 111_000
+
+
+def update_service_current_location(service: "Service", lat: float, lng: float):
+    """Haydovchining jonli koordinatalarini yangilaydi va, agar kerak
+    bo'lsa (oldingi nuqtadan yetarlicha uzoqlashgan yoki manzil hali
+    aniqlanmagan bo'lsa), Viloyat/Tuman manzilini qayta hisoblaydi.
+    Har bir mayda (bir necha metrlik) GPS yangilanishida Nominatim'ga
+    so'rov yubormaslik uchun ~300 metr chegarasi qo'yilgan - aks holda
+    tez-tez yangilanadigan jonli joylashuv tashqi xizmatni haddan
+    tashqari yuklab yuboradi."""
+    needs_geocode = (
+        service.current_address is None
+        or service.current_latitude is None
+        or service.current_longitude is None
+        or _approx_distance_meters(
+            service.current_latitude, service.current_longitude, lat, lng
+        ) > 300
+    )
+    service.current_latitude = lat
+    service.current_longitude = lng
+    if needs_geocode:
+        resolved = reverse_geocode_region_district(lat, lng)
+        if resolved is not None:
+            service.current_address = resolved
+
+def display_service_address(service: "Service") -> Optional[str]:
+    """Evakuator/benzin dastavka uchun STATIK `address` deyarli har doim
+    bo'sh bo'ladi (ro'yxatdan o'tishda kiritilmaydi) - shuning uchun bunday
+    provayderlar uchun jonli joylashuvdan aniqlangan `current_address`
+    (Viloyat, Tuman) qaytariladi. Oddiy avtoservislar uchun esa har doim
+    o'zining statik manzili qaytadi."""
+    if service.provider_type in ("evacuator", "fuel"):
+        return service.current_address or service.address
+    return service.address
 
 # ============================================
 # PYDANTIC SCHEMAS
@@ -1104,7 +1217,7 @@ def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
         "is_verified": service.is_verified,
         "is_active": service.is_active,
         "reject_reason": service.reject_reason,
-        "address": service.address,
+        "address": display_service_address(service),
         "phone": service.phone,
         "rating": service.rating,
         "review_count": service.review_count,
@@ -1200,7 +1313,7 @@ def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpda
         "id": service.id,
         "name": service.name,
         "phone": service.phone,
-        "address": service.address,
+        "address": display_service_address(service),
         "latitude": service.latitude,
         "longitude": service.longitude,
         "working_hours": service.working_hours,
@@ -1792,7 +1905,7 @@ def get_services(
             "name": s.name,
             "description": s.description,
             "phone": s.phone,
-            "address": s.address,
+            "address": display_service_address(s),
             "latitude": display_lat,
             "longitude": display_lng,
             "rating": s.rating,
@@ -1819,14 +1932,20 @@ def get_service_detail(service_id: int, db: Session = Depends(get_db)):
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
+    # Evakuator/fuel uchun statik latitude/longitude yo'q - o'rniga ish
+    # vaqtida yuborilgan jonli joylashuv ko'rsatiladi (nearby-services
+    # ro'yxati bilan bir xil mantiq).
+    display_lat = service.current_latitude if service.provider_type in ("evacuator", "fuel") else service.latitude
+    display_lng = service.current_longitude if service.provider_type in ("evacuator", "fuel") else service.longitude
+
     return {
         "id": service.id,
         "name": service.name,
         "description": service.description,
         "phone": service.phone,
-        "address": service.address,
-        "latitude": service.latitude,
-        "longitude": service.longitude,
+        "address": display_service_address(service),
+        "latitude": display_lat,
+        "longitude": display_lng,
         "rating": service.rating,
         "review_count": service.review_count,
         "working_hours": service.working_hours,
@@ -2036,7 +2155,7 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
             "id": order.service.id,
             "name": order.service.name,
             "phone": order.service.phone,
-            "address": order.service.address,
+            "address": display_service_address(order.service),
             "latitude": order.service.latitude,
             "longitude": order.service.longitude,
             "provider_type": order.service.provider_type,
@@ -2175,7 +2294,7 @@ def get_favorites(user_id: int, db: Session = Depends(get_db)):
         {
             "id": f.service.id,
             "name": f.service.name,
-            "address": f.service.address,
+            "address": display_service_address(f.service),
             "rating": f.service.rating,
             "phone": f.service.phone
         }
@@ -2363,7 +2482,7 @@ def admin_get_services(status: Optional[str] = None, provider_type: Optional[str
             "owner_id": s.owner_id,
             "owner_name": s.owner.name,
             "phone": s.phone,
-            "address": s.address,
+            "address": display_service_address(s),
             "latitude": s.latitude,
             "longitude": s.longitude,
             "logo_url": s.logo_url,
@@ -2455,8 +2574,7 @@ def service_owner_go_online(owner_id: int, request: LocationUpdateRequest, db: S
     if service.provider_type not in ("evacuator", "fuel"):
         raise HTTPException(status_code=400, detail="Bu faqat evakuator/benzin dastavka uchun")
     service.is_online = True
-    service.current_latitude = request.latitude
-    service.current_longitude = request.longitude
+    update_service_current_location(service, request.latitude, request.longitude)
     service.location_updated_at = func.now()
     db.commit()
     return {"is_online": True}
@@ -2477,8 +2595,7 @@ def service_owner_update_location(owner_id: int, request: LocationUpdateRequest,
     service = db.query(Service).filter(Service.owner_id == owner_id).first()
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
-    service.current_latitude = request.latitude
-    service.current_longitude = request.longitude
+    update_service_current_location(service, request.latitude, request.longitude)
     service.location_updated_at = func.now()
     db.commit()
     return {"success": True, "is_online": service.is_online}
@@ -2567,7 +2684,7 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
             "id": service.id,
             "name": service.name,
             "phone": service.phone,
-            "address": service.address,
+            "address": display_service_address(service),
             "latitude": service.latitude,
             "longitude": service.longitude,
             "working_hours": service.working_hours,
