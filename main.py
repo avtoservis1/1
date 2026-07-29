@@ -992,6 +992,8 @@ def create_notification(db: Session, user_id: int, title: str, message: str, typ
 ORDER_STATUS_LABELS = {
     "pending": "Kutilmoqda",
     "accepted": "Qabul qilindi",
+    "on_way": "Yo'lda",
+    "arrived": "Yetib keldi",
     "completed": "Yakunlandi",
     "cancelled": "Bekor qilindi",
 }
