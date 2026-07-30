@@ -715,6 +715,13 @@ class ServiceOwnerProfileUpdate(BaseModel):
     description: Optional[str] = None
     logo_base64: Optional[str] = None
 
+class ChangePasswordRequest(BaseModel):
+    """Har qanday rol (user / service_owner / admin) o'z kirish parolini
+    o'zgartirishi uchun - joriy parol tasdiqlanadi, so'ng yangisi saqlanadi."""
+    user_id: int
+    old_password: str
+    new_password: str = Field(..., min_length=6)
+
 class ServiceOfferedUpsert(BaseModel):
     """Servis egasi 'Xizmatlarni boshqarish' bo'limida yangi xizmat (erkin nomli)
     qo'shadi yoki mavjudining narxi/holatini yangilaydi. Yangi xizmat har doim
@@ -1769,6 +1776,22 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         "phone": user.phone,
         "role": user.role
     }
+
+@app.post("/api/change-password")
+def change_password(request: ChangePasswordRequest, db: Session = Depends(get_db)):
+    """Har qanday rol (oddiy foydalanuvchi, servis egasi yoki admin) o'z kirish
+    parolini o'zgartiradi. Avval joriy parol tekshiriladi, so'ng yangisi saqlanadi."""
+    user = db.query(User).filter(User.id == request.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+
+    if user.password_hash != hash_password(request.old_password):
+        raise HTTPException(status_code=401, detail="Joriy parol noto'g'ri")
+
+    user.password_hash = hash_password(request.new_password)
+    db.commit()
+
+    return {"success": True}
 
 # ============================================
 # USER ENDPOINTS
