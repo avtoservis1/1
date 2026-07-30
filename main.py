@@ -844,6 +844,21 @@ def generate_token(user_id: int) -> str:
 def generate_otp() -> str:
     return str(random.randint(1000, 9999))
 
+def _phone_recently_verified(db: Session, phone: str, minutes: int = 30) -> bool:
+    """
+    Ro'yxatdan o'tishdan oldin telefon raqam /api/send-otp + /api/verify-otp
+    orqali haqiqatan ham tasdiqlanganini serverda tekshiradi (frontend buni
+    "aylanib o'tolmasligi" uchun). So'nggi `minutes` daqiqa ichida shu
+    raqam uchun tasdiqlangan (is_used=True) OTP yozuvi bo'lsa - rozi.
+    """
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(minutes=minutes)
+    verified = db.query(OTPCode).filter(
+        OTPCode.phone == phone,
+        OTPCode.is_used == True,
+        OTPCode.created_at >= cutoff,
+    ).order_by(OTPCode.created_at.desc()).first()
+    return verified is not None
+
 # ============================================
 # ADMIN BOOTSTRAP
 # ============================================
@@ -1046,19 +1061,6 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
 def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
     """OTP kodni tasdiqlash"""
 
-    # VAQTINCHALIK MASTER-KOD (TEST UCHUN): "1234" har doim qabul qilinadi.
-    # PRODUCTIONGA CHIQISHDAN OLDIN BU BLOKNI O'CHIRIB TASHLANG!
-    if request.code == "1234":
-        otp = OTPCode(
-            phone=request.phone,
-            code=request.code,
-            expires_at=datetime.datetime.utcnow() + datetime.timedelta(minutes=5),
-            is_used=True,
-        )
-        db.add(otp)
-        db.commit()
-        return {"success": True, "message": "Kod tasdiqlandi"}
-
     otp = db.query(OTPCode).filter(
         OTPCode.phone == request.phone,
         OTPCode.code == request.code,
@@ -1081,6 +1083,14 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.phone == request.phone).first()
     if existing:
         raise HTTPException(status_code=400, detail="Bu telefon raqam allaqachon ro'yxatdan o'tgan")
+
+    # Telefon raqam /api/send-otp + /api/verify-otp orqali oldindan SMS bilan
+    # tasdiqlangan bo'lishi shart - aks holda ro'yxatdan o'tish rad etiladi.
+    if not _phone_recently_verified(db, request.phone):
+        raise HTTPException(
+            status_code=400,
+            detail="Telefon raqam tasdiqlanmagan. Avval SMS kodni tasdiqlang."
+        )
 
     # Create user
     password_hash = hash_password(request.password)
@@ -1138,6 +1148,14 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
     else:
         if not request.car_model:
             raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
+
+    # Telefon raqam /api/send-otp + /api/verify-otp orqali oldindan SMS bilan
+    # tasdiqlangan bo'lishi shart - aks holda ro'yxatdan o'tish rad etiladi.
+    if not _phone_recently_verified(db, request.phone):
+        raise HTTPException(
+            status_code=400,
+            detail="Telefon raqam tasdiqlanmagan. Avval SMS kodni tasdiqlang."
+        )
 
     user = db.query(User).filter(User.phone == request.phone).first()
     full_name = f"{request.first_name} {request.last_name}".strip()
@@ -1755,7 +1773,14 @@ def service_owner_reviews(owner_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/login")
 def login(request: LoginRequest, db: Session = Depends(get_db)):
-    """Foydalanuvchi login"""
+    """
+    Foydalanuvchi login - 1-bosqich (telefon + parol).
+    Parol to'g'ri bo'lsa: admin uchun darhol token qaytariladi, oddiy
+    foydalanuvchi va servis egasi (provayder) uchun esa har safar kirishda
+    qo'shimcha xavfsizlik uchun telefon raqamiga SMS tasdiqlash kodi
+    yuboriladi va token faqat /api/login/verify-otp orqali kod to'g'ri
+    tasdiqlangandan keyin beriladi (2-bosqichli login).
+    """
     user = db.query(User).filter(User.phone == request.phone).first()
     if not user:
         raise HTTPException(status_code=401, detail="Telefon raqam yoki parol noto'g'ri")
@@ -1765,6 +1790,64 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Akkaunt bloklangan")
+
+    # Admin panelga kirishda SMS talab qilinmaydi.
+    if user.role == UserRole.ADMIN.value:
+        token = generate_token(user.id)
+        return {
+            "success": True,
+            "token": token,
+            "user_id": user.id,
+            "name": user.name,
+            "phone": user.phone,
+            "role": user.role
+        }
+
+    code = generate_otp()
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
+    otp = OTPCode(phone=user.phone, code=code, expires_at=expires_at)
+    db.add(otp)
+    db.commit()
+
+    message = f"AutoService kirish tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+    sent = send_sms(user.phone, message)
+    if not sent:
+        raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
+
+    response = {
+        "success": True,
+        "requires_otp": True,
+        "phone": user.phone,
+        "message": "Kirishni tasdiqlash uchun SMS kod yuborildi",
+        "expires_in": 300,
+    }
+    if os.getenv("APP_ENV") != "production":
+        response["demo_code"] = code
+    return response
+
+
+@app.post("/api/login/verify-otp")
+def login_verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
+    """Login - 2-bosqich: SMS kodni tasdiqlab, kirish tokenini qaytaradi."""
+    user = db.query(User).filter(User.phone == request.phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Akkaunt bloklangan")
+
+    otp = db.query(OTPCode).filter(
+        OTPCode.phone == request.phone,
+        OTPCode.code == request.code,
+        OTPCode.is_used == False,
+        OTPCode.expires_at > datetime.datetime.utcnow()
+    ).order_by(OTPCode.created_at.desc()).first()
+
+    if not otp:
+        raise HTTPException(status_code=400, detail="Noto'g'ri yoki eskirgan kod")
+
+    otp.is_used = True
+    db.commit()
 
     token = generate_token(user.id)
 
