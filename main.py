@@ -21,6 +21,9 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
 import enum
+import json
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 # ============================================
 # DATABASE CONFIGURATION (ENV)
@@ -38,6 +41,57 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# ============================================
+# FIREBASE ADMIN (ANDROID PUSH BILDIRISHNOMALARI)
+# ============================================
+# Railway'ning "Variables" bo'limida FIREBASE_SERVICE_ACCOUNT_JSON nomli
+# environment variable yarating va uning qiymatiga Firebase konsolidan
+# olingan xizmat hisobi (service account) JSON faylining TO'LIQ mazmunini
+# (butun JSON matnini, bitta qatorga qo'yib) joylashtiring.
+# Qanday olish: Firebase Console -> Project settings -> Service accounts ->
+# Generate new private key.
+_firebase_app = None
+FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+if FIREBASE_SERVICE_ACCOUNT_JSON:
+    try:
+        _cred_dict = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
+        _firebase_app = firebase_admin.initialize_app(credentials.Certificate(_cred_dict))
+        logging.getLogger("uvicorn.error").info("[firebase] Push bildirishnomalar uchun Firebase Admin ishga tushdi")
+    except Exception as e:
+        logging.getLogger("uvicorn.error").error(f"[firebase] Firebase Admin ishga tushmadi: {e}")
+else:
+    logging.getLogger("uvicorn.error").warning(
+        "[firebase] FIREBASE_SERVICE_ACCOUNT_JSON o'rnatilmagan - push bildirishnomalar o'chirilgan holda ishlaydi "
+        "(ilova ichidagi bildirishnomalar baribir odatdagidek ishlaydi)."
+    )
+
+
+def send_push_notification(token: Optional[str], title: str, body: str, data: Optional[dict] = None):
+    """
+    Android qurilmasiga real push bildirishnoma yuboradi (Firebase FCM orqali).
+    Token bo'lmasa yoki Firebase sozlanmagan bo'lsa, jimgina hech narsa qilmaydi -
+    bu asosiy amalni (buyurtma yaratish va h.k.) hech qachon buzmasligi kerak.
+    """
+    if not token or _firebase_app is None:
+        return
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            data={k: str(v) for k, v in (data or {}).items()},
+            token=token,
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="autoservis_default",
+                    sound="default",
+                ),
+            ),
+        )
+        messaging.send(message)
+    except Exception as e:
+        logging.getLogger("uvicorn.error").warning(f"[firebase] Push yuborishda xatolik (token eskirgan bo'lishi mumkin): {e}")
+
 
 # ============================================
 # ENUMS
@@ -78,6 +132,10 @@ class User(Base):
     password_hash = Column(String(256), nullable=False)
     role = Column(String(20), default=UserRole.USER.value)
     avatar_url = Column(String(500), nullable=True)
+    # Android qurilmasidan olingan Firebase Cloud Messaging registratsiya tokeni.
+    # Foydalanuvchi/servis egasi/admin ilovaga kirganda shu yerga yoziladi va
+    # real push bildirishnoma yuborish uchun ishlatiladi (create_notification orqali).
+    fcm_token = Column(String(500), nullable=True)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -996,7 +1054,11 @@ logger = logging.getLogger("uvicorn.error")
 # BILDIRISHNOMA YORDAMCHI FUNKSIYASI
 # ============================================
 def create_notification(db: Session, user_id: int, title: str, message: str, type: str = "admin", related_id: Optional[int] = None):
-    """Ilova ichidagi bildirishnoma yaratadi. Xatolik bo'lsa asosiy amalni buzmaslik uchun jimgina o'tkazib yuboradi."""
+    """
+    Ilova ichidagi bildirishnoma yaratadi va (agar foydalanuvchining qurilmasi
+    ro'yxatdan o'tgan bo'lsa) Firebase orqali real push bildirishnoma ham yuboradi.
+    Xatolik bo'lsa asosiy amalni buzmaslik uchun jimgina o'tkazib yuboradi.
+    """
     try:
         notif = Notification(
             user_id=user_id,
@@ -1010,6 +1072,19 @@ def create_notification(db: Session, user_id: int, title: str, message: str, typ
     except Exception as e:
         logging.error(f"Bildirishnoma yaratishda xatolik: {e}")
         db.rollback()
+        return
+
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user and user.fcm_token:
+            send_push_notification(
+                user.fcm_token,
+                title,
+                message,
+                data={"type": type, "related_id": related_id or ""},
+            )
+    except Exception as e:
+        logging.error(f"Push bildirishnoma yuborishda xatolik: {e}")
 
 ORDER_STATUS_LABELS = {
     "pending": "Kutilmoqda",
@@ -3084,6 +3159,26 @@ def admin_set_user_role(user_id: int, role: str, db: Session = Depends(get_db)):
     user.role = role
     db.commit()
     return {"id": user.id, "role": user.role}
+
+# ---- Push bildirishnoma: qurilma tokenini ro'yxatdan o'tkazish ----
+class FcmTokenRequest(BaseModel):
+    user_id: int
+    token: str
+
+@app.post("/api/register-fcm-token")
+def register_fcm_token(request: FcmTokenRequest, db: Session = Depends(get_db)):
+    """
+    Foydalanuvchi/servis egasi/admin ilovaga kirganda (yoki ilova ochilganda,
+    token yangilanganda) Flutter tomondan chaqiriladi. Olingan FCM tokenni
+    userga bog'lab saqlaydi - keyinchalik create_notification() shu token
+    orqali real push yuboradi.
+    """
+    user = db.query(User).filter(User.id == request.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+    user.fcm_token = request.token
+    db.commit()
+    return {"success": True}
 
 # ---- Admin: bildirishnoma yuborish ----
 class NotificationRequest(BaseModel):
