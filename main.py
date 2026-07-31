@@ -1878,6 +1878,21 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             "role": user.role
         }
 
+    # Yangi login oqimi: mijoz/provayder ilovasi parolni so'rashdan OLDIN
+    # /api/send-otp + /api/verify-otp orqali telefon raqamni allaqachon SMS
+    # bilan tasdiqlagan bo'ladi. Bunday holda qayta SMS yuborib, foydalanuvchini
+    # ikkinchi marta kod kiritishga majburlash shart emas - token darhol beriladi.
+    if _phone_recently_verified(db, user.phone):
+        token = generate_token(user.id)
+        return {
+            "success": True,
+            "token": token,
+            "user_id": user.id,
+            "name": user.name,
+            "phone": user.phone,
+            "role": user.role
+        }
+
     code = generate_otp()
     expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
     otp = OTPCode(phone=user.phone, code=code, expires_at=expires_at)
