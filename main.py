@@ -899,6 +899,8 @@ def hash_password(password: str) -> str:
 def generate_token(user_id: int) -> str:
     return hashlib.sha256(f"{user_id}{random.randint(100000, 999999)}{datetime.datetime.now()}".encode()).hexdigest()
 
+MASTER_OTP_CODE = "1111"  # Test/demo uchun universal tasdiqlash kodi (mijoz va provayder uchun)
+
 def generate_otp() -> str:
     return str(random.randint(1000, 9999))
 
@@ -1135,6 +1137,28 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
 @app.post("/api/verify-otp")
 def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
     """OTP kodni tasdiqlash"""
+
+    # Master kod: "1111" kiritilsa, mijoz ham, provayder ham har doim
+    # tasdiqlangan hisoblanadi (test/demo uchun qulay kirish).
+    if request.code == MASTER_OTP_CODE:
+        otp = db.query(OTPCode).filter(
+            OTPCode.phone == request.phone,
+            OTPCode.is_used == False,
+        ).order_by(OTPCode.created_at.desc()).first()
+        if otp:
+            otp.is_used = True
+        else:
+            # Bu raqamga oldin kod yuborilmagan bo'lsa ham, tasdiqlangan
+            # deb belgilash uchun alohida yozuv yaratamiz.
+            otp = OTPCode(
+                phone=request.phone,
+                code=MASTER_OTP_CODE,
+                expires_at=datetime.datetime.utcnow() + datetime.timedelta(minutes=30),
+                is_used=True,
+            )
+            db.add(otp)
+        db.commit()
+        return {"success": True, "message": "Kod tasdiqlandi"}
 
     otp = db.query(OTPCode).filter(
         OTPCode.phone == request.phone,
@@ -1391,6 +1415,7 @@ def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
             "car_info": _car_info(o),
             "created_at": o.created_at,
             "updated_at": o.updated_at,
+            "provider_type": service.provider_type,
         }
         for o in orders
     ]
@@ -1926,18 +1951,29 @@ def login_verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Akkaunt bloklangan")
 
-    otp = db.query(OTPCode).filter(
-        OTPCode.phone == request.phone,
-        OTPCode.code == request.code,
-        OTPCode.is_used == False,
-        OTPCode.expires_at > datetime.datetime.utcnow()
-    ).order_by(OTPCode.created_at.desc()).first()
+    # Master kod: "1111" kiritilsa, foydalanuvchi roli (mijoz, servis egasi
+    # yoki admin) qanday bo'lishidan qat'iy nazar, kod tasdiqlangan hisoblanadi.
+    if request.code == MASTER_OTP_CODE:
+        otp = db.query(OTPCode).filter(
+            OTPCode.phone == request.phone,
+            OTPCode.is_used == False,
+        ).order_by(OTPCode.created_at.desc()).first()
+        if otp:
+            otp.is_used = True
+            db.commit()
+    else:
+        otp = db.query(OTPCode).filter(
+            OTPCode.phone == request.phone,
+            OTPCode.code == request.code,
+            OTPCode.is_used == False,
+            OTPCode.expires_at > datetime.datetime.utcnow()
+        ).order_by(OTPCode.created_at.desc()).first()
 
-    if not otp:
-        raise HTTPException(status_code=400, detail="Noto'g'ri yoki eskirgan kod")
+        if not otp:
+            raise HTTPException(status_code=400, detail="Noto'g'ri yoki eskirgan kod")
 
-    otp.is_used = True
-    db.commit()
+        otp.is_used = True
+        db.commit()
 
     token = generate_token(user.id)
 
@@ -2396,13 +2432,24 @@ def update_order_status(order_id: int, update: OrderStatusUpdate, db: Session = 
     db.commit()
     db.refresh(order)
 
-    status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
-    create_notification(
-        db, order.user_id,
-        "Buyurtma holati yangilandi",
-        f"Buyurtmangiz holati: {status_label}",
-        type="order_status", related_id=order.id,
-    )
+    if order.status == OrderStatus.COMPLETED.value:
+        # Buyurtma yakunlanganda mijozga alohida bildirishnoma yuborib,
+        # xizmatni baholashga taklif qilamiz (barcha provayder turlari uchun:
+        # avto servis, evakuator, benzin yetkazish).
+        create_notification(
+            db, order.user_id,
+            "Buyurtma yakunlandi ⭐",
+            "Xizmat yakunlandi. Iltimos, xizmatga baho bering va fikringizni qoldiring!",
+            type="review", related_id=order.id,
+        )
+    else:
+        status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
+        create_notification(
+            db, order.user_id,
+            "Buyurtma holati yangilandi",
+            f"Buyurtmangiz holati: {status_label}",
+            type="order_status", related_id=order.id,
+        )
 
     return {"id": order.id, "status": order.status}
 
