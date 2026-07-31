@@ -4,3 +4,4 @@ sqlalchemy==2.0.51
 psycopg2-binary==2.9.12
 pydantic==2.13.4
 requests==2.32.3
+firebase_admin==7.5.0
