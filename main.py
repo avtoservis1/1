@@ -267,7 +267,10 @@ class PricingSettings(Base):
     belgilanadi. Har doim yagona qator (id=1) sifatida saqlanadi.
     - evacuator_price: evakuator chaqirish uchun belgilangan narx (so'm).
     - fuel_delivery_fee: benzin yetkazib berish xizmati uchun narx (so'm).
-    - fuel_price_per_liter: benzinning har bir litri uchun narx (so'm/litr).
+    - fuel_price_per_liter: eski (umumiy) 1 litr narxi - endi ishlatilmaydi,
+      orqaga moslik uchun saqlab qolingan.
+    - fuel_price_ai92/95/98/100/hyperfuel: har bir benzin turi uchun alohida
+      1 litr narxi (so'm/litr) - admin panelidan tahrirlanadi.
     """
     __tablename__ = "pricing_settings"
 
@@ -275,7 +278,22 @@ class PricingSettings(Base):
     evacuator_price = Column(Float, default=0)
     fuel_delivery_fee = Column(Float, default=120000)
     fuel_price_per_liter = Column(Float, default=16000)
+    fuel_price_ai92 = Column(Float, default=15000)
+    fuel_price_ai95 = Column(Float, default=18000)
+    fuel_price_ai98 = Column(Float, default=20000)
+    fuel_price_ai100 = Column(Float, default=25000)
+    fuel_price_hyperfuel = Column(Float, default=45000)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+# Benzin dastavka uchun tanlanadigan benzin turlari va ularning ko'rinadigan
+# nomlari. PricingSettings dagi mos ustun nomi "fuel_price_<id>".
+FUEL_TYPE_LABELS = {
+    "ai92": "AI-92",
+    "ai95": "AI-95",
+    "ai98": "AI-98",
+    "ai100": "AI-100",
+    "hyperfuel": "HyperFuel",
+}
 
 class Order(Base):
     __tablename__ = "orders"
@@ -293,6 +311,12 @@ class Order(Base):
     # so'ragan benzin miqdori (litr). Narx shundan kelib chiqib hisoblanadi:
     # price = fuel_delivery_fee + liters * fuel_price_per_liter.
     liters = Column(Float, nullable=True)
+    # Faqat benzin dastavka (category == "fuel") buyurtmalari uchun: mijoz
+    # tanlagan benzin turi - "ai92" | "ai95" | "ai98" | "ai100" | "hyperfuel".
+    fuel_type = Column(String(20), nullable=True)
+    # Evakuator va benzin dastavka chaqiruvlari uchun MAJBURIY: mijoz
+    # "Shoshilinch" yoki "Shoshilinch emas"ni tanlaydi. True = shoshilinch.
+    is_urgent = Column(Boolean, default=False, nullable=True)
     # "now" - mijoz hozir servisga o'zi boradi/chaqiradi (darhol xizmat).
     # "scheduled" - mijoz kelajakdagi sana/vaqtga bron qilyapti.
     # Faqat auto_service (oddiy avtoservis) buyurtmalari uchun ma'noga ega -
@@ -487,8 +511,26 @@ def seed_pricing_settings():
     try:
         existing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
         if existing is None:
-            db.add(PricingSettings(id=1, evacuator_price=0, fuel_delivery_fee=120000, fuel_price_per_liter=16000))
+            db.add(PricingSettings(
+                id=1, evacuator_price=0, fuel_delivery_fee=120000, fuel_price_per_liter=16000,
+                fuel_price_ai92=15000, fuel_price_ai95=18000, fuel_price_ai98=20000,
+                fuel_price_ai100=25000, fuel_price_hyperfuel=45000,
+            ))
             db.commit()
+        else:
+            # Auto-migration ustunlarni NULL holida qo'shgan bo'lishi mumkin
+            # (eski qatorlar uchun) - shu sababli standart narxlar bilan to'ldiramiz.
+            defaults = {
+                "fuel_price_ai92": 15000, "fuel_price_ai95": 18000, "fuel_price_ai98": 20000,
+                "fuel_price_ai100": 25000, "fuel_price_hyperfuel": 45000,
+            }
+            changed = False
+            for field, default in defaults.items():
+                if getattr(existing, field, None) is None:
+                    setattr(existing, field, default)
+                    changed = True
+            if changed:
+                db.commit()
     finally:
         db.close()
 
@@ -842,6 +884,10 @@ class OrderCreate(BaseModel):
     # Faqat category == "fuel" (benzin dastavka) uchun: nechi litr kerakligi.
     # Narx shu asosda avtomatik hisoblanadi (global narxlar sozlamalaridan).
     liters: Optional[float] = None
+    # Faqat benzin dastavka uchun MAJBURIY: "ai92" | "ai95" | "ai98" | "ai100" | "hyperfuel".
+    fuel_type: Optional[str] = None
+    # Evakuator va benzin dastavka uchun MAJBURIY: True = Shoshilinch, False = Shoshilinch emas.
+    is_urgent: Optional[bool] = None
     # "now" (hozir borish) yoki "scheduled" (bron qilish).
     order_type: str = "now"
     # order_type == "scheduled" bo'lganda majburiy - ISO 8601 format
@@ -869,6 +915,11 @@ class PricingUpdate(BaseModel):
     evacuator_price: Optional[float] = None
     fuel_delivery_fee: Optional[float] = None
     fuel_price_per_liter: Optional[float] = None
+    fuel_price_ai92: Optional[float] = None
+    fuel_price_ai95: Optional[float] = None
+    fuel_price_ai98: Optional[float] = None
+    fuel_price_ai100: Optional[float] = None
+    fuel_price_hyperfuel: Optional[float] = None
 
 class OrderStatusUpdate(BaseModel):
     status: str
@@ -898,8 +949,6 @@ def hash_password(password: str) -> str:
 
 def generate_token(user_id: int) -> str:
     return hashlib.sha256(f"{user_id}{random.randint(100000, 999999)}{datetime.datetime.now()}".encode()).hexdigest()
-
-MASTER_OTP_CODE = "1111"  # Test/demo uchun universal tasdiqlash kodi (mijoz va provayder uchun)
 
 def generate_otp() -> str:
     return str(random.randint(1000, 9999))
@@ -1137,28 +1186,6 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
 @app.post("/api/verify-otp")
 def verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
     """OTP kodni tasdiqlash"""
-
-    # Master kod: "1111" kiritilsa, mijoz ham, provayder ham har doim
-    # tasdiqlangan hisoblanadi (test/demo uchun qulay kirish).
-    if request.code == MASTER_OTP_CODE:
-        otp = db.query(OTPCode).filter(
-            OTPCode.phone == request.phone,
-            OTPCode.is_used == False,
-        ).order_by(OTPCode.created_at.desc()).first()
-        if otp:
-            otp.is_used = True
-        else:
-            # Bu raqamga oldin kod yuborilmagan bo'lsa ham, tasdiqlangan
-            # deb belgilash uchun alohida yozuv yaratamiz.
-            otp = OTPCode(
-                phone=request.phone,
-                code=MASTER_OTP_CODE,
-                expires_at=datetime.datetime.utcnow() + datetime.timedelta(minutes=30),
-                is_used=True,
-            )
-            db.add(otp)
-        db.commit()
-        return {"success": True, "message": "Kod tasdiqlandi"}
 
     otp = db.query(OTPCode).filter(
         OTPCode.phone == request.phone,
@@ -1408,6 +1435,9 @@ def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
             "description": o.description,
             "status": o.status,
             "price": o.price,
+            "liters": o.liters,
+            "fuel_type": o.fuel_type,
+            "is_urgent": o.is_urgent,
             "order_type": o.order_type,
             "scheduled_at": o.scheduled_at,
             "user_latitude": o.user_latitude,
@@ -1951,29 +1981,18 @@ def login_verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Akkaunt bloklangan")
 
-    # Master kod: "1111" kiritilsa, foydalanuvchi roli (mijoz, servis egasi
-    # yoki admin) qanday bo'lishidan qat'iy nazar, kod tasdiqlangan hisoblanadi.
-    if request.code == MASTER_OTP_CODE:
-        otp = db.query(OTPCode).filter(
-            OTPCode.phone == request.phone,
-            OTPCode.is_used == False,
-        ).order_by(OTPCode.created_at.desc()).first()
-        if otp:
-            otp.is_used = True
-            db.commit()
-    else:
-        otp = db.query(OTPCode).filter(
-            OTPCode.phone == request.phone,
-            OTPCode.code == request.code,
-            OTPCode.is_used == False,
-            OTPCode.expires_at > datetime.datetime.utcnow()
-        ).order_by(OTPCode.created_at.desc()).first()
+    otp = db.query(OTPCode).filter(
+        OTPCode.phone == request.phone,
+        OTPCode.code == request.code,
+        OTPCode.is_used == False,
+        OTPCode.expires_at > datetime.datetime.utcnow()
+    ).order_by(OTPCode.created_at.desc()).first()
 
-        if not otp:
-            raise HTTPException(status_code=400, detail="Noto'g'ri yoki eskirgan kod")
+    if not otp:
+        raise HTTPException(status_code=400, detail="Noto'g'ri yoki eskirgan kod")
 
-        otp.is_used = True
-        db.commit()
+    otp.is_used = True
+    db.commit()
 
     token = generate_token(user.id)
 
@@ -2287,17 +2306,29 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     # kelgan narxga ishonilmaydi).
     computed_price = None
     liters = None
+    fuel_type = None
+    is_urgent = False
     if service.provider_type == "evacuator":
+        # Shoshilinch/shoshilinch emasligini tanlash majburiy.
+        if order.is_urgent is None:
+            raise HTTPException(status_code=400, detail="Shoshilinch yoki shoshilinch emasligini tanlang")
+        is_urgent = order.is_urgent
         pricing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
         computed_price = pricing.evacuator_price if pricing else None
     elif service.provider_type == "fuel":
+        if order.is_urgent is None:
+            raise HTTPException(status_code=400, detail="Shoshilinch yoki shoshilinch emasligini tanlang")
+        is_urgent = order.is_urgent
+        if not order.fuel_type or order.fuel_type not in FUEL_TYPE_LABELS:
+            raise HTTPException(status_code=400, detail="Benzin turini tanlang")
         if order.liters is None or order.liters <= 0:
             raise HTTPException(status_code=400, detail="Benzin miqdorini (litr) kiriting")
+        fuel_type = order.fuel_type
         pricing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
         delivery_fee = pricing.fuel_delivery_fee if pricing else 0
-        price_per_liter = pricing.fuel_price_per_liter if pricing else 0
+        price_per_liter = getattr(pricing, f"fuel_price_{fuel_type}", 0) if pricing else 0
         liters = order.liters
-        computed_price = delivery_fee + liters * price_per_liter
+        computed_price = delivery_fee + liters * (price_per_liter or 0)
 
     # Evakuator/benzin dastavka - har doim "hozir" turidagi chaqiruv,
     # bron qilib bo'lmaydi (mijoz frontend orqali order_type yubormasa ham
@@ -2323,6 +2354,8 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
         user_longitude=order.user_longitude,
         price=computed_price,
         liters=liters,
+        fuel_type=fuel_type,
+        is_urgent=is_urgent,
         order_type=order_type,
         scheduled_at=scheduled_at,
         status=OrderStatus.PENDING.value
@@ -2348,6 +2381,8 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
         "order_type": new_order.order_type,
         "scheduled_at": new_order.scheduled_at,
         "service_name": service.name,
+        "fuel_type": new_order.fuel_type,
+        "is_urgent": new_order.is_urgent,
         "created_at": new_order.created_at
     }
 
@@ -2361,6 +2396,9 @@ def get_user_orders(user_id: int, db: Session = Depends(get_db)):
             "category": o.category,
             "status": o.status,
             "price": o.price,
+            "liters": o.liters,
+            "fuel_type": o.fuel_type,
+            "is_urgent": o.is_urgent,
             "order_type": o.order_type,
             "scheduled_at": o.scheduled_at,
             "created_at": o.created_at,
@@ -2410,6 +2448,8 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
         "user_longitude": order.user_longitude,
         "price": order.price,
         "liters": order.liters,
+        "fuel_type": order.fuel_type,
+        "is_urgent": order.is_urgent,
         "driver_location": driver_location,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
@@ -2676,6 +2716,9 @@ def admin_get_orders(status: Optional[str] = None, scope: Optional[str] = None, 
             "category": o.category,
             "status": o.status,
             "price": o.price,
+            "liters": o.liters,
+            "fuel_type": o.fuel_type,
+            "is_urgent": o.is_urgent,
             "order_type": o.order_type,
             "scheduled_at": o.scheduled_at,
             "created_at": o.created_at
@@ -2712,6 +2755,9 @@ def admin_get_order_detail(order_id: int, db: Session = Depends(get_db)):
         "user_latitude": order.user_latitude,
         "user_longitude": order.user_longitude,
         "price": order.price,
+        "liters": order.liters,
+        "fuel_type": order.fuel_type,
+        "is_urgent": order.is_urgent,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
         "completed_at": order.completed_at,
@@ -3113,6 +3159,9 @@ def get_service_owner_order_detail(order_id: int, db: Session = Depends(get_db))
         "description": order.description,
         "status": order.status,
         "price": order.price,
+        "liters": order.liters,
+        "fuel_type": order.fuel_type,
+        "is_urgent": order.is_urgent,
         "created_at": order.created_at,
         "updated_at": order.updated_at,
     }
@@ -3171,13 +3220,32 @@ def get_categories(db: Session = Depends(get_db)):
     return result
 
 # ---- Evakuator/benzin dastavka uchun GLOBAL narxlar ----
+_FUEL_PRICE_DEFAULTS = {
+    "fuel_price_ai92": 15000, "fuel_price_ai95": 18000, "fuel_price_ai98": 20000,
+    "fuel_price_ai100": 25000, "fuel_price_hyperfuel": 45000,
+}
+
 def _get_or_create_pricing(db: Session) -> PricingSettings:
     pricing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
     if pricing is None:
-        pricing = PricingSettings(id=1, evacuator_price=0, fuel_delivery_fee=120000, fuel_price_per_liter=16000)
+        pricing = PricingSettings(
+            id=1, evacuator_price=0, fuel_delivery_fee=120000, fuel_price_per_liter=16000,
+            **_FUEL_PRICE_DEFAULTS,
+        )
         db.add(pricing)
         db.commit()
         db.refresh(pricing)
+    else:
+        # Eski qatorlarda auto-migration ustunlarni NULL qilib qo'shgan bo'lishi
+        # mumkin - shu sababli standart narxlar bilan to'ldiramiz.
+        changed = False
+        for field, default in _FUEL_PRICE_DEFAULTS.items():
+            if getattr(pricing, field, None) is None:
+                setattr(pricing, field, default)
+                changed = True
+        if changed:
+            db.commit()
+            db.refresh(pricing)
     return pricing
 
 @app.get("/api/pricing")
@@ -3192,6 +3260,15 @@ def get_pricing(db: Session = Depends(get_db)):
         "evacuator_price": pricing.evacuator_price,
         "fuel_delivery_fee": pricing.fuel_delivery_fee,
         "fuel_price_per_liter": pricing.fuel_price_per_liter,
+        "fuel_price_ai92": pricing.fuel_price_ai92,
+        "fuel_price_ai95": pricing.fuel_price_ai95,
+        "fuel_price_ai98": pricing.fuel_price_ai98,
+        "fuel_price_ai100": pricing.fuel_price_ai100,
+        "fuel_price_hyperfuel": pricing.fuel_price_hyperfuel,
+        "fuel_types": [
+            {"id": fid, "label": label, "price_per_liter": getattr(pricing, f"fuel_price_{fid}")}
+            for fid, label in FUEL_TYPE_LABELS.items()
+        ],
     }
 
 @app.put("/api/admin/pricing")
@@ -3204,12 +3281,27 @@ def admin_update_pricing(request: PricingUpdate, db: Session = Depends(get_db)):
         pricing.fuel_delivery_fee = request.fuel_delivery_fee
     if request.fuel_price_per_liter is not None:
         pricing.fuel_price_per_liter = request.fuel_price_per_liter
+    if request.fuel_price_ai92 is not None:
+        pricing.fuel_price_ai92 = request.fuel_price_ai92
+    if request.fuel_price_ai95 is not None:
+        pricing.fuel_price_ai95 = request.fuel_price_ai95
+    if request.fuel_price_ai98 is not None:
+        pricing.fuel_price_ai98 = request.fuel_price_ai98
+    if request.fuel_price_ai100 is not None:
+        pricing.fuel_price_ai100 = request.fuel_price_ai100
+    if request.fuel_price_hyperfuel is not None:
+        pricing.fuel_price_hyperfuel = request.fuel_price_hyperfuel
     db.commit()
     db.refresh(pricing)
     return {
         "evacuator_price": pricing.evacuator_price,
         "fuel_delivery_fee": pricing.fuel_delivery_fee,
         "fuel_price_per_liter": pricing.fuel_price_per_liter,
+        "fuel_price_ai92": pricing.fuel_price_ai92,
+        "fuel_price_ai95": pricing.fuel_price_ai95,
+        "fuel_price_ai98": pricing.fuel_price_ai98,
+        "fuel_price_ai100": pricing.fuel_price_ai100,
+        "fuel_price_hyperfuel": pricing.fuel_price_hyperfuel,
     }
 
 # ---- Admin: foydalanuvchini bloklash ----
