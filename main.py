@@ -1821,6 +1821,11 @@ def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
                 "customer_name": o.user.name if o.user else None,
                 "category": o.category,
                 "status": o.status,
+                "price": o.price,
+                "liters": o.liters,
+                "fuel_type": o.fuel_type,
+                "is_urgent": o.is_urgent,
+                "provider_type": service.provider_type,
                 "created_at": o.created_at,
             }
             for o in recent
