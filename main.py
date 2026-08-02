@@ -953,6 +953,20 @@ def generate_token(user_id: int) -> str:
 def generate_otp() -> str:
     return str(random.randint(1000, 9999))
 
+# ============================================
+# TEST TELEFON RAQAMLARI
+# ============================================
+# Google Play / App Store tekshiruvchilari yoki QA jamoasi haqiqiy SMS
+# ololmaydi, shuning uchun bu ro'yxatdagi raqamlar uchun har doim bitta
+# belgilangan kod (TEST_OTP_CODE) ishlaydi va haqiqiy SMS yuborilmaydi.
+# (Bu Firebase Phone Auth'dagi "test phone numbers" funksiyasi bilan bir xil
+# g'oya.) Kerak bo'lsa shu ro'yxatga yana raqam qo'shishingiz mumkin —
+# lekin bularni faqat tekshiruv/test uchun ishlating, productionda unutmang.
+TEST_PHONE_NUMBERS = {
+    "+998900000001",
+}
+TEST_OTP_CODE = "1111"
+
 def _phone_recently_verified(db: Session, phone: str, minutes: int = 30) -> bool:
     """
     Ro'yxatdan o'tishdan oldin telefon raqam /api/send-otp + /api/verify-otp
@@ -1157,7 +1171,8 @@ async def unhandled_exception_handler(request, exc):
 @app.post("/api/send-otp")
 def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
     """Telefon raqamga SMS orqali tasdiqlash kodi yuborish"""
-    code = generate_otp()
+    is_test_phone = request.phone in TEST_PHONE_NUMBERS
+    code = TEST_OTP_CODE if is_test_phone else generate_otp()
     expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
 
     # Save OTP
@@ -1165,8 +1180,13 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
     db.add(otp)
     db.commit()
 
-    message = f"AutoService tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
-    sent = send_sms(request.phone, message)
+    if is_test_phone:
+        # Test raqami — haqiqiy SMS yuborilmaydi, kod har doim TEST_OTP_CODE.
+        print(f"[TEST RAQAM] {request.phone} -> kod so'ralindi, doimiy kod ishlatiladi")
+        sent = True
+    else:
+        message = f"AutoService tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+        sent = send_sms(request.phone, message)
 
     if not sent:
         raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
