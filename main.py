@@ -1079,7 +1079,9 @@ def send_sms(phone: str, message: str) -> bool:
             },
             timeout=10,
         )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            print(f"SMS yuborishda xatolik: {resp.status_code} - {resp.text}")
+            return False
         return True
     except Exception as e:
         print(f"SMS yuborishda xatolik: {e}")
@@ -1185,7 +1187,7 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
         print(f"[TEST RAQAM] {request.phone} -> kod so'ralindi, doimiy kod ishlatiladi")
         sent = True
     else:
-        message = f"AutoService tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+        message = f"GoFix ilovasiga kirish uchun tasdiqlash kodi: {code}, 5 daqiqa amal qiladi."
         sent = send_sms(request.phone, message)
 
     if not sent:
@@ -1979,7 +1981,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     db.add(otp)
     db.commit()
 
-    message = f"AutoService kirish tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+    message = f"GoFix ilovasiga kirish uchun tasdiqlash kodi: {code}, 5 daqiqa amal qiladi."
     sent = send_sms(user.phone, message)
     if not sent:
         raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
