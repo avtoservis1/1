@@ -537,177 +537,6 @@ def seed_pricing_settings():
 seed_pricing_settings()
 
 # ============================================
-# SEED: Sedan/Krossover uchun standart xizmat turlari katalogi
-# ============================================
-# Bu ro'yxat admin bergan narxnoma (Word fayl) asosida - "auto_service"
-# xizmat egalarining barchasi uchun standart xizmat turlari to'plami.
-# ServiceType katalogiga bir marta (mavjud bo'lmasa) qo'shiladi, so'ngra har
-# bir mavjud avtoservisga ham "yoqilgan" (is_active=True) holatda avtomatik
-# biriktiriladi - servis egasi keyinchalik xohlagan xizmatini o'chirib
-# tashlashi yoki qo'shimcha ravishda boshqa turlarni yoqishi mumkin. Yangi
-# ro'yxatdan o'tadigan avtoservislarga esa {register_service_owner}
-# ichida xuddi shu tarzda avtomatik biriktiriladi (pastga qarang).
-DEFAULT_SERVICE_TYPES = [
-    ("Tashrif buyurish bilan texnik maslahat", 100000),
-    ("Telefon orqali texnik maslahat", 60000),
-    ("Dvigatelni o'lik batareya bilan ishga tushirish", 130000),
-    ("Texnikaviy suyuqliklarni yetkazib berish*", 100000),
-    ("Shinalarga dam berish", 110000),
-    ("G‘ildirakni almashtirish", 140000),
-    ("G‘ildirakni ta’mirlash", 200000),
-    ("Gi'ldirakni teshigini jgut bilan ta'miralash", 110000),
-    ("Oʻgʻirlikka qarshi tizimni blokdan chiqarish", 500000),
-    ("Saqlagichni almashtirish", 110000),
-    ("O’t oldirish tizimini diagnostika qilish va sozlash", 300000),
-    ("Eshik qulflarini taʼmirlash va sozlash", 180000),
-    ("GRM qayishini almashtirish", 400000),
-    ("Klapanlar qopqog‘ining prokladkasini almashtirish", 400000),
-    ("Dvigatel yostig‘ini almashtirish", 350000),
-    ("Oyna tozalagichning cho‘tkalarini almashtirish", 100000),
-    ("Qanotostini almashtirish", 250000),
-    ("Loy sachrashidan himoya o‘rnatish", 180000),
-    ("Eshik tutqichlarini almashtirish", 200000),
-    ("Yon oynalarni almashtirish", 350000),
-    ("Oyna ko‘targichni almashtirish", 350000),
-    ("Bamperni almashtirish", 600000),
-    ("GUR suyuqligini almashtirish", 200000),
-    ("GUR qayishini almashtirish", 400000),
-    ("GUR nasosini almashtirish", 450000),
-    ("GUR nasosining shlangini almashtirish", 300000),
-    ("Antifriz va tosolni almashtirish", 200000),
-    ("Pompani almashtirish", 500000),
-    ("Termostatni almashtirish", 400000),
-    ("Qisqa naychani (patrubok) almashtirish", 250000),
-    ("Benzonasosni almashtirish", 500000),
-    ("Dvigatel forsunkalarini almashtirish", 300000),
-    ("Gaz yuritmasi trosini almashtirish", 250000),
-    ("Asosiy tormoz silindrini almashtirish", 400000),
-    ("Tormoz shlangini almashtirish", 350000),
-    ("Tormoz diskini almashtirish", 350000),
-    ("Tormoz suyuqligini almashtirish", 200000),
-    ("Ort tormoz silindrini almashtirish", 400000),
-    ("Tormoz barabanini almashtirish", 400000),
-    ("Tormoz tizimidan qon ketish", 200000),
-    ("Ilashish troschasini almashtirish (mexanik uzatma qutisida)", 350000),
-    ("Yonilg‘i filtrini almashtirish (tashqi)", 300000),
-    ("Salon filtrini almashtirish", 200000),
-    ("Havo filtrini almashtirish", 130000),
-    ("Tashqi granatani almashtirish", 350000),
-    ("Rul tyagasini almashtirish", 350000),
-    ("Sharli tayanchni almashtirish", 350000),
-    ("Stabilizator ustunlarini almashtirish", 300000),
-    ("Tashqi granataning changtutgichini almashtirish", 350000),
-    ("Rulda uchliklarini almashtirish", 350000),
-    ("Stupitsani (yig‘ma olida) almashtirish", 400000),
-    ("Ort va old osma amortizatorining prujinalarini almashtirish", 400000),
-    ("Ort va old osma amortizatorini yig‘ma holatida almashtirish", 400000),
-    ("Yuqori kuchlanish simlarini almashtirish", 200000),
-    ("Generator qayishini almashtirish", 300000),
-    ("Generatorni almashtirish", 450000),
-    ("Datchiklarni almashtirish", 250000),
-    ("Saqlagich tashlab yuborsa", 200000),
-    ("Oyna tozalagichga manbani ulash", 250000),
-    ("Oyna ko‘targichga manbani ulash", 350000),
-    ("Radiator ventilyatoriga manbani ulash", 250000),
-    ("Kapot qismga namlik tushishi", 500000),
-    ("Kapot elektronikani almashtirish", 1500000),
-    ("Panel osti elektronikani almashtirish", 1700000),
-    ("Tramblerni almashtirish", 300000),
-    ("Starterni almashtirish", 300000),
-    ("Orqa chiroq lampalarini almashtirish", 100000),
-    ("Old faraning lampalarini almashtirish", 100000),
-    ("Tuman faralarining lampalarini almashtirish", 100000),
-    ("Klaksonni almashtirish", 100000),
-    ("Old oynani yuvish forsunkalarini almashtirish", 100000),
-    ("Raqam belgisini yorituvchi lampalarini almashtirish", 100000),
-    ("Akkumulyatorni quvvatlab ishga tushirish", 130000),
-    ("G‘ildirakni zapaska bilan almashtirish", 140000),
-    ("Avto ehtiyot qismlarini yetkazib berish", 100000),
-    ("Texnik suyuqliklarni yetkazib berish (antifriz, moy, yuvish suyuqligi va boshqalar)", 100000),
-    ("Shinani havo bilan to‘ldirish", 110000),
-    ("Shinamontaj / shinaning kichik ta’miri", 200000),
-    ("Shina teshigini ta’mirlash", 110000),
-    ("Zajiganiyeni sozlash", 300000),
-    ("Old/Orqa stoykani almashtirish (osma)", 400000),
-    ("Harorat datchigini almashtirish", 200000),
-    ("GUR moyini almashtirish", 200000),
-    ("Signalni almashtirish", 100000),
-    ("Oldi va orqa osma stoykalari prujinalarini almashtirish", 400000),
-    ("Kapot ostidagi namlikni yo‘qotish", 500000),
-    ("Signalizatsiyani blokdan chiqarish", 500000),
-]
-
-def _ensure_default_service_types(db):
-    """Katalogga DEFAULT_SERVICE_TYPES ro'yxatidan hali yo'q bo'lganlarini
-    qo'shadi (nomi bo'yicha, katta-kichik harfga sezgirmas taqqoslash bilan)
-    va shu turlarga mos ServiceType id'lari ro'yxatini qaytaradi."""
-    existing_types = db.query(ServiceType).all()
-    existing_by_name = {t.name.strip().lower(): t for t in existing_types}
-    ids = []
-    for name, price in DEFAULT_SERVICE_TYPES:
-        key = name.strip().lower()
-        stype = existing_by_name.get(key)
-        if stype is None:
-            stype = ServiceType(name=name, price=price, icon="build", is_active=True)
-            db.add(stype)
-            db.flush()
-            existing_by_name[key] = stype
-        ids.append(stype.id)
-    db.commit()
-    return ids
-
-def attach_default_service_types(db, service_id: int):
-    """Berilgan (auto_service) servisga standart xizmat turlaridan hali
-    biriktirilmaganlarini "yoqilgan" (is_active=True) holda qo'shadi. Yangi
-    ro'yxatdan o'tayotgan servis uchun ham (register_service_owner), eskilar
-    uchun ham (seed_default_service_types) ishlatiladi."""
-    ids = _ensure_default_service_types(db)
-    if not ids:
-        return
-    types_by_id = {t.id: t for t in db.query(ServiceType).filter(ServiceType.id.in_(ids)).all()}
-    already = {
-        tid for (tid,) in db.query(ServiceOffered.service_type_id).filter(
-            ServiceOffered.service_id == service_id,
-            ServiceOffered.service_type_id.in_(ids),
-        ).all()
-    }
-    to_add = []
-    for tid in ids:
-        if tid in already:
-            continue
-        stype = types_by_id.get(tid)
-        if stype is None:
-            continue
-        to_add.append(ServiceOffered(
-            service_id=service_id,
-            service_type_id=tid,
-            category=stype.name,
-            price=stype.price,
-            is_active=True,
-            status="approved",
-            added_by_admin=True,
-        ))
-    if to_add:
-        db.bulk_save_objects(to_add)
-        db.commit()
-
-def seed_default_service_types():
-    from sqlalchemy.orm import Session as _Session
-    db = _Session(bind=engine)
-    try:
-        _ensure_default_service_types(db)
-        # Barcha mavjud "auto_service" servislariga ham biriktiramiz.
-        auto_service_ids = [
-            sid for (sid,) in db.query(Service.id).filter(Service.provider_type == "auto_service").all()
-        ]
-        for sid in auto_service_ids:
-            attach_default_service_types(db, sid)
-    finally:
-        db.close()
-
-seed_default_service_types()
-
-# ============================================
 # ONE-OFF FIX: services.address/latitude/longitude -> NULLABLE
 # ============================================
 # Evakuator va benzin dastavka provayderlari ro'yxatdan o'tishda manzil/xarita
@@ -1220,10 +1049,6 @@ def _get_eskiz_token() -> str:
         data={"email": ESKIZ_EMAIL, "password": ESKIZ_PASSWORD},
         timeout=10,
     )
-    if resp.status_code >= 400:
-        # Login bosqichida xato bo'lsa (masalan parol o'zgargan/eskirgan),
-        # sababini to'liq ko'rish uchun javob matnini ham log qilamiz.
-        print(f"Eskiz login xatosi: {resp.status_code} -> {resp.text[:500]}")
     resp.raise_for_status()
     token = resp.json()["data"]["token"]
 
@@ -1241,10 +1066,10 @@ def send_sms(phone: str, message: str) -> bool:
         print(f"[SMS DEMO REJIM] {phone} -> {message}")
         return True
 
-    clean_phone = phone.replace("+", "").replace(" ", "").strip()
-
-    def _do_send(token: str):
-        return requests.post(
+    try:
+        token = _get_eskiz_token()
+        clean_phone = phone.replace("+", "")
+        resp = requests.post(
             f"{ESKIZ_BASE_URL}/message/sms/send",
             headers={"Authorization": f"Bearer {token}"},
             data={
@@ -1254,29 +1079,25 @@ def send_sms(phone: str, message: str) -> bool:
             },
             timeout=10,
         )
-
-    try:
-        token = _get_eskiz_token()
-        resp = _do_send(token)
-
-        # Token eskirgan/yaroqsiz bo'lsa (401), keshni tozalab bir marta
-        # yangi token bilan qayta urinib ko'ramiz.
         if resp.status_code == 401:
+            # Token eskirgan/bekor qilingan bo'lishi mumkin - keshni tozalab, bir marta qayta urinamiz
             _eskiz_token_cache["token"] = None
             _eskiz_token_cache["expires_at"] = None
             token = _get_eskiz_token()
-            resp = _do_send(token)
+            resp = requests.post(
+                f"{ESKIZ_BASE_URL}/message/sms/send",
+                headers={"Authorization": f"Bearer {token}"},
+                data={
+                    "mobile_phone": clean_phone,
+                    "message": message,
+                    "from": ESKIZ_SMS_FROM,
+                },
+                timeout=10,
+            )
 
         if resp.status_code >= 400:
-            # Eskiz javobining TO'LIQ matnini (status kodi + JSON/body) log
-            # qilamiz - aks holda faqat "400 Bad Request" ko'rinib, aynan
-            # nima sabab (balans tugagan, nickname tasdiqlanmagan, matn
-            # noto'g'ri va h.k.) ekani noma'lum bo'lib qolaveradi.
-            print(
-                f"SMS yuborishda xatolik: Eskiz {resp.status_code} -> {resp.text[:500]}"
-            )
+            print(f"SMS yuborishda xatolik: {resp.status_code} -> {resp.text}")
             return False
-
         return True
     except Exception as e:
         print(f"SMS yuborishda xatolik: {e}")
@@ -1544,13 +1365,6 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
     db.add(service)
     db.commit()
     db.refresh(service)
-
-    # Yangi avtoservis uchun ham standart xizmat turlari (Sedan/Krossover
-    # narxnomasidagi 87 ta xizmat) darhol "yoqilgan" holda biriktiriladi -
-    # servis egasi keyinchalik "Xizmatlarni boshqarish" bo'limidan
-    # xohlaganini o'chirib tashlashi yoki qo'shimcha turlarni yoqishi mumkin.
-    if service.provider_type == "auto_service":
-        attach_default_service_types(db, service.id)
 
     token = generate_token(user.id)
 
