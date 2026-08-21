@@ -1203,7 +1203,7 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
         print(f"[TEST RAQAM] {request.phone} -> kod so'ralindi, doimiy kod ishlatiladi")
         sent = True
     else:
-        message = f"GoFix tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+        message = f"GoFix ilovasiga kirish uchun tasdiqlash kodi: {code}, 5 daqiqa amal qiladi."
         sent = send_sms(request.phone, message)
 
     if not sent:
@@ -1997,7 +1997,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     db.add(otp)
     db.commit()
 
-    message = f"GoFix kirish tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+    message = f"GoFix ilovasiga kirish uchun tasdiqlash kodi: {code}, 5 daqiqa amal qiladi."
     sent = send_sms(user.phone, message)
     if not sent:
         raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
