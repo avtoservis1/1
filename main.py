@@ -1107,7 +1107,7 @@ def send_sms(phone: str, message: str) -> bool:
 # FASTAPI APP
 # ============================================
 app = FastAPI(
-    title="AutoService API",
+    title="GoFix API",
     description="Avtoservis ilovasi uchun backend API",
     version="1.0.0",
 )
@@ -1203,7 +1203,7 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
         print(f"[TEST RAQAM] {request.phone} -> kod so'ralindi, doimiy kod ishlatiladi")
         sent = True
     else:
-        message = f"AutoService tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+        message = f"GoFix tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
         sent = send_sms(request.phone, message)
 
     if not sent:
@@ -1997,7 +1997,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     db.add(otp)
     db.commit()
 
-    message = f"AutoService kirish tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
+    message = f"GoFix kirish tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
     sent = send_sms(user.phone, message)
     if not sent:
         raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
@@ -3151,7 +3151,7 @@ def admin_statistics(db: Session = Depends(get_db)):
 # ============================================
 @app.get("/")
 def root():
-    return {"message": "AutoService API ishlamoqda", "version": "1.0.0"}
+    return {"message": "GoFix API ishlamoqda", "version": "1.0.0"}
 
 @app.get("/health")
 def health_check():
