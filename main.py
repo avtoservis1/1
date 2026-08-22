@@ -286,8 +286,8 @@ class PricingSettings(Base):
     # Elektr dastavka va moyka chaqirish - bularda bir nechta provayder emas,
     # bitta admin belgilagan telefon raqami bor; foydalanuvchi shu raqamga
     # to'g'ridan-to'g'ri qo'ng'iroq qiladi (buyurtma/marketplace oqimi yo'q).
-    electric_delivery_phone = Column(String(30), nullable=True)
-    carwash_call_phone = Column(String(30), nullable=True)
+    electric_delivery_phone = Column(String(30), nullable=True, default="+998770907394")
+    carwash_call_phone = Column(String(30), nullable=True, default="+998770907394")
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 # Benzin dastavka uchun tanlanadigan benzin turlari va ularning ko'rinadigan
@@ -3307,22 +3307,28 @@ _FUEL_PRICE_DEFAULTS = {
     "fuel_price_ai92": 15000, "fuel_price_ai95": 18000, "fuel_price_ai98": 20000,
     "fuel_price_ai100": 25000, "fuel_price_hyperfuel": 45000,
 }
+# Elektr dastavka va moyka chaqirish uchun standart operator raqami -
+# admin xohlasa /api/admin/pricing orqali keyinchalik o'zgartirishi mumkin.
+_PHONE_DEFAULTS = {
+    "electric_delivery_phone": "+998770907394",
+    "carwash_call_phone": "+998770907394",
+}
 
 def _get_or_create_pricing(db: Session) -> PricingSettings:
     pricing = db.query(PricingSettings).filter(PricingSettings.id == 1).first()
     if pricing is None:
         pricing = PricingSettings(
             id=1, evacuator_price=0, fuel_delivery_fee=120000, fuel_price_per_liter=16000,
-            **_FUEL_PRICE_DEFAULTS,
+            **_FUEL_PRICE_DEFAULTS, **_PHONE_DEFAULTS,
         )
         db.add(pricing)
         db.commit()
         db.refresh(pricing)
     else:
         # Eski qatorlarda auto-migration ustunlarni NULL qilib qo'shgan bo'lishi
-        # mumkin - shu sababli standart narxlar bilan to'ldiramiz.
+        # mumkin - shu sababli standart narxlar/raqamlar bilan to'ldiramiz.
         changed = False
-        for field, default in _FUEL_PRICE_DEFAULTS.items():
+        for field, default in {**_FUEL_PRICE_DEFAULTS, **_PHONE_DEFAULTS}.items():
             if getattr(pricing, field, None) is None:
                 setattr(pricing, field, default)
                 changed = True
