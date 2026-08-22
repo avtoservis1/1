@@ -283,6 +283,11 @@ class PricingSettings(Base):
     fuel_price_ai98 = Column(Float, default=20000)
     fuel_price_ai100 = Column(Float, default=25000)
     fuel_price_hyperfuel = Column(Float, default=45000)
+    # Elektr dastavka va moyka chaqirish - bularda bir nechta provayder emas,
+    # bitta admin belgilagan telefon raqami bor; foydalanuvchi shu raqamga
+    # to'g'ridan-to'g'ri qo'ng'iroq qiladi (buyurtma/marketplace oqimi yo'q).
+    electric_delivery_phone = Column(String(30), nullable=True)
+    carwash_call_phone = Column(String(30), nullable=True)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 # Benzin dastavka uchun tanlanadigan benzin turlari va ularning ko'rinadigan
@@ -294,6 +299,25 @@ FUEL_TYPE_LABELS = {
     "ai100": "AI-100",
     "hyperfuel": "HyperFuel",
 }
+
+class PartnerLocation(Base):
+    """
+    Admin tomonidan kiritiladigan "moyka" (avtomobil yuvish) va "zapravka"
+    (yoqilg'i quyish shoxobchasi) manzillari. Bular Evakuator/Benzin
+    dastavka kabi chaqiriladigan xizmat emas - foydalanuvchi faqat
+    ro'yxatdan/xaritadan joylashuvlarni ko'radi. location_type: "carwash"
+    yoki "gasstation".
+    """
+    __tablename__ = "partner_locations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    location_type = Column(String(20), nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    address = Column(String(500), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class Order(Base):
     __tablename__ = "orders"
@@ -914,12 +938,28 @@ class OrderCreate(BaseModel):
 class PricingUpdate(BaseModel):
     evacuator_price: Optional[float] = None
     fuel_delivery_fee: Optional[float] = None
+    electric_delivery_phone: Optional[str] = None
+    carwash_call_phone: Optional[str] = None
     fuel_price_per_liter: Optional[float] = None
     fuel_price_ai92: Optional[float] = None
     fuel_price_ai95: Optional[float] = None
     fuel_price_ai98: Optional[float] = None
     fuel_price_ai100: Optional[float] = None
     fuel_price_hyperfuel: Optional[float] = None
+
+class PartnerLocationCreate(BaseModel):
+    location_type: str  # "carwash" yoki "gasstation"
+    name: str
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class PartnerLocationUpdate(BaseModel):
+    name: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    is_active: Optional[bool] = None
 
 class OrderStatusUpdate(BaseModel):
     status: str
@@ -1203,7 +1243,7 @@ def send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
         print(f"[TEST RAQAM] {request.phone} -> kod so'ralindi, doimiy kod ishlatiladi")
         sent = True
     else:
-        message = f"GoFix ilovasiga kirish uchun tasdiqlash kodi: {code}, 5 daqiqa amal qiladi."
+        message = f"GoFix tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
         sent = send_sms(request.phone, message)
 
     if not sent:
@@ -1997,7 +2037,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     db.add(otp)
     db.commit()
 
-    message = f"GoFix ilovasiga kirish uchun tasdiqlash kodi: {code}, 5 daqiqa amal qiladi."
+    message = f"GoFix kirish tasdiqlash kodi: {code}. Kodni hech kimga bermang!"
     sent = send_sms(user.phone, message)
     if not sent:
         raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
@@ -3308,6 +3348,8 @@ def get_pricing(db: Session = Depends(get_db)):
         "fuel_price_ai98": pricing.fuel_price_ai98,
         "fuel_price_ai100": pricing.fuel_price_ai100,
         "fuel_price_hyperfuel": pricing.fuel_price_hyperfuel,
+        "electric_delivery_phone": pricing.electric_delivery_phone,
+        "carwash_call_phone": pricing.carwash_call_phone,
         "fuel_types": [
             {"id": fid, "label": label, "price_per_liter": getattr(pricing, f"fuel_price_{fid}")}
             for fid, label in FUEL_TYPE_LABELS.items()
@@ -3322,6 +3364,10 @@ def admin_update_pricing(request: PricingUpdate, db: Session = Depends(get_db)):
         pricing.evacuator_price = request.evacuator_price
     if request.fuel_delivery_fee is not None:
         pricing.fuel_delivery_fee = request.fuel_delivery_fee
+    if request.electric_delivery_phone is not None:
+        pricing.electric_delivery_phone = request.electric_delivery_phone.strip()
+    if request.carwash_call_phone is not None:
+        pricing.carwash_call_phone = request.carwash_call_phone.strip()
     if request.fuel_price_per_liter is not None:
         pricing.fuel_price_per_liter = request.fuel_price_per_liter
     if request.fuel_price_ai92 is not None:
@@ -3345,7 +3391,106 @@ def admin_update_pricing(request: PricingUpdate, db: Session = Depends(get_db)):
         "fuel_price_ai98": pricing.fuel_price_ai98,
         "fuel_price_ai100": pricing.fuel_price_ai100,
         "fuel_price_hyperfuel": pricing.fuel_price_hyperfuel,
+        "electric_delivery_phone": pricing.electric_delivery_phone,
+        "carwash_call_phone": pricing.carwash_call_phone,
     }
+
+# ============================================
+# MOYKA / ZAPRAVKA MANZILLARI (faqat joylashuv - admin kiritadi)
+# ============================================
+def _location_dict(loc: "PartnerLocation", include_status: bool = False) -> dict:
+    data = {
+        "id": loc.id,
+        "location_type": loc.location_type,
+        "name": loc.name,
+        "address": loc.address,
+        "latitude": loc.latitude,
+        "longitude": loc.longitude,
+    }
+    if include_status:
+        data["is_active"] = loc.is_active
+    return data
+
+@app.get("/api/locations")
+def list_locations(location_type: str, db: Session = Depends(get_db)):
+    """
+    Foydalanuvchi ilovasi uchun ochiq ro'yxat: "moyka" yoki "zapravka"
+    manzillari. Faqat admin faollashtirgan (is_active) yozuvlar chiqadi.
+    location_type: "carwash" (moyka) yoki "gasstation" (zapravka).
+    """
+    if location_type not in ("carwash", "gasstation"):
+        raise HTTPException(status_code=400, detail="location_type noto'g'ri")
+    locs = (
+        db.query(PartnerLocation)
+        .filter(PartnerLocation.location_type == location_type, PartnerLocation.is_active == True)
+        .order_by(PartnerLocation.id.desc())
+        .all()
+    )
+    return [_location_dict(l) for l in locs]
+
+@app.get("/api/admin/locations")
+def admin_list_locations(location_type: str, db: Session = Depends(get_db)):
+    """Admin panel: moyka/zapravka manzillari - faol va nofaollari ham chiqadi."""
+    if location_type not in ("carwash", "gasstation"):
+        raise HTTPException(status_code=400, detail="location_type noto'g'ri")
+    locs = (
+        db.query(PartnerLocation)
+        .filter(PartnerLocation.location_type == location_type)
+        .order_by(PartnerLocation.id.desc())
+        .all()
+    )
+    return [_location_dict(l, include_status=True) for l in locs]
+
+@app.post("/api/admin/locations")
+def admin_create_location(request: PartnerLocationCreate, db: Session = Depends(get_db)):
+    """Admin moyka yoki zapravka uchun yangi manzil qo'shadi."""
+    if request.location_type not in ("carwash", "gasstation"):
+        raise HTTPException(status_code=400, detail="location_type noto'g'ri")
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nomi bo'sh bo'lishi mumkin emas")
+    loc = PartnerLocation(
+        location_type=request.location_type,
+        name=name,
+        address=(request.address or "").strip() or None,
+        latitude=request.latitude,
+        longitude=request.longitude,
+        is_active=True,
+    )
+    db.add(loc)
+    db.commit()
+    db.refresh(loc)
+    return _location_dict(loc, include_status=True)
+
+@app.put("/api/admin/locations/{location_id}")
+def admin_update_location(location_id: int, request: PartnerLocationUpdate, db: Session = Depends(get_db)):
+    """Admin mavjud moyka/zapravka manzilini tahrirlaydi."""
+    loc = db.query(PartnerLocation).filter(PartnerLocation.id == location_id).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Manzil topilmadi")
+    if request.name is not None and request.name.strip():
+        loc.name = request.name.strip()
+    if request.address is not None:
+        loc.address = request.address.strip() or None
+    if request.latitude is not None:
+        loc.latitude = request.latitude
+    if request.longitude is not None:
+        loc.longitude = request.longitude
+    if request.is_active is not None:
+        loc.is_active = request.is_active
+    db.commit()
+    db.refresh(loc)
+    return _location_dict(loc, include_status=True)
+
+@app.delete("/api/admin/locations/{location_id}")
+def admin_delete_location(location_id: int, db: Session = Depends(get_db)):
+    """Admin moyka/zapravka manzilini butunlay o'chiradi."""
+    loc = db.query(PartnerLocation).filter(PartnerLocation.id == location_id).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Manzil topilmadi")
+    db.delete(loc)
+    db.commit()
+    return {"success": True}
 
 # ---- Admin: foydalanuvchini bloklash ----
 @app.put("/api/admin/users/{user_id}/role")
