@@ -822,6 +822,11 @@ class ServiceOwnerRegisterRequest(BaseModel):
     # "auto_service" | "evacuator" | "fuel" - qaysi turdagi provayder sifatida
     # royxatdan otayotgani.
     provider_type: str = "auto_service"
+    # Faqat auto_service uchun: ro'yxatdan o'tishda mijoz admin katalogidan
+    # (ServiceType) darhol tanlagan xizmat turlari - shu ID'lar servis
+    # yaratilgan zahoti 'approved' ServiceOffered yozuvlariga aylanadi va
+    # mijozlarga servis profilida darhol ko'rinadi.
+    service_type_ids: Optional[List[int]] = None
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -1440,6 +1445,29 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
     db.add(service)
     db.commit()
     db.refresh(service)
+
+    # Ro'yxatdan o'tishda tanlangan xizmat turlari (faqat auto_service uchun
+    # mazmunli) - darhol 'approved' ServiceOffered yozuvlariga aylantiramiz,
+    # shunda ular admin tasdig'ini kutmasdan servis profilida ko'rinadi
+    # (servis o'zi hali 'pending' bo'lsa ham, admin tasdiqlagach darhol
+    # to'liq ro'yxat bilan chiqadi).
+    if request.provider_type == "auto_service" and request.service_type_ids:
+        unique_ids = set(request.service_type_ids)
+        stypes = db.query(ServiceType).filter(
+            ServiceType.id.in_(unique_ids), ServiceType.is_active == True
+        ).all()
+        for stype in stypes:
+            db.add(ServiceOffered(
+                service_id=service.id,
+                service_type_id=stype.id,
+                category=stype.name,
+                price=stype.price,
+                is_active=True,
+                status="approved",
+                added_by_admin=False,
+            ))
+        if stypes:
+            db.commit()
 
     token = generate_token(user.id)
 
