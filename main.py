@@ -325,7 +325,11 @@ class Order(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     service_id = Column(Integer, ForeignKey("services.id"), nullable=False)
-    category = Column(String(50), nullable=False)
+    # Bir necha xizmat turi birga tanlanganda ("Dvigatel diagnostikasi, Yog'
+    # almashtirish" kabi) matn eski VARCHAR(50) chegarasidan oshib ketishi
+    # mumkin, shu sababli kengroq ustun kerak (pastdagi auto-migration bilan
+    # birga ishlaydi).
+    category = Column(String(300), nullable=False)
     status = Column(String(20), default=OrderStatus.PENDING.value)
     description = Column(Text, nullable=True)
     user_latitude = Column(Float, nullable=True)
@@ -525,6 +529,32 @@ def widen_services_offered_category_column():
         )
 
 widen_services_offered_category_column()
+
+# ============================================
+# ONE-OFF FIX: widen orders.category to VARCHAR(300)
+# ============================================
+# Mijoz endi bitta servis ichida bir nechta xizmat turini birga tanlashi
+# mumkin (masalan "Dvigatel diagnostikasi, Yog' almashtirish") - bu matn
+# eski VARCHAR(50) chegarasidan oshib ketishi mumkin edi.
+def widen_orders_category_column():
+    import logging
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "orders" not in inspector.get_table_names():
+        return
+    columns = {col["name"]: col for col in inspector.get_columns("orders")}
+    cat_col = columns.get("category")
+    if cat_col is None:
+        return
+    if "VARCHAR(50)" in str(cat_col["type"]).upper():
+        with engine.begin() as conn:
+            conn.execute(text('ALTER TABLE "orders" ALTER COLUMN "category" TYPE VARCHAR(300)'))
+        logging.getLogger("uvicorn.error").warning(
+            "[auto-migration] widened orders.category from VARCHAR(50) to VARCHAR(300)"
+        )
+
+widen_orders_category_column()
 
 # ============================================
 # SEED: evakuator/benzin dastavka uchun global narxlar (bitta qator)
