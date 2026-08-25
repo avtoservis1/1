@@ -228,7 +228,8 @@ class ServiceType(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200), nullable=False)  # xizmat turi nomi - admin belgilaydi
     price = Column(Float, nullable=True)  # narxi - admin belgilaydi
-    icon = Column(String(50), default="build")  # frontendda ko'rsatiladigan ikonka nomi
+    icon = Column(String(50), default="build")  # frontendda ko'rsatiladigan ikonka nomi (rasm bo'lmasa shu ko'rsatiladi)
+    image_url = Column(Text, nullable=True)  # admin yuklagan rasm (base64 data-URL). Bo'lmasa, frontend `icon`ni ko'rsatadi.
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -288,6 +289,14 @@ class PricingSettings(Base):
     # to'g'ridan-to'g'ri qo'ng'iroq qiladi (buyurtma/marketplace oqimi yo'q).
     electric_delivery_phone = Column(String(30), nullable=True, default="+998770907394")
     carwash_call_phone = Column(String(30), nullable=True, default="+998770907394")
+    # "Qo'shimcha xizmatlar" ro'yxatidagi har bir band uchun admin yuklaydigan rasm
+    # (base64 data-URL). Rasm bo'lmasa, frontend standart ikonkani ko'rsatadi.
+    evacuator_image = Column(Text, nullable=True)
+    fuel_image = Column(Text, nullable=True)
+    carwash_locations_image = Column(Text, nullable=True)
+    gasstation_locations_image = Column(Text, nullable=True)
+    electric_delivery_image = Column(Text, nullable=True)
+    carwash_call_image = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 # Benzin dastavka uchun tanlanadigan benzin turlari va ularning ko'rinadigan
@@ -555,6 +564,44 @@ def widen_orders_category_column():
         )
 
 widen_orders_category_column()
+
+# ============================================
+# ONE-OFF FIX: add image columns for icon->image feature
+# ============================================
+# ServiceType.image_url va PricingSettings dagi har bir "qo'shimcha xizmat"
+# uchun rasm ustunlari eski bazalarda mavjud emas - shu yerda avtomatik
+# qo'shiladi (agar hali yo'q bo'lsa).
+def add_missing_image_columns():
+    import logging
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    targets = {
+        "service_types": ["image_url"],
+        "pricing_settings": [
+            "evacuator_image",
+            "fuel_image",
+            "carwash_locations_image",
+            "gasstation_locations_image",
+            "electric_delivery_image",
+            "carwash_call_image",
+        ],
+    }
+    table_names = inspector.get_table_names()
+    for table, cols in targets.items():
+        if table not in table_names:
+            continue
+        existing_cols = {c["name"] for c in inspector.get_columns(table)}
+        for col in cols:
+            if col in existing_cols:
+                continue
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{col}" TEXT'))
+            logging.getLogger("uvicorn.error").warning(
+                f"[auto-migration] added column {table}.{col}"
+            )
+
+add_missing_image_columns()
 
 # ============================================
 # SEED: evakuator/benzin dastavka uchun global narxlar (bitta qator)
@@ -897,12 +944,15 @@ class ServiceTypeCreate(BaseModel):
     name: str
     price: Optional[float] = None
     icon: Optional[str] = "build"
+    image_url: Optional[str] = None  # admin yuklagan rasm (base64 data-URL)
 
 class ServiceTypeUpdate(BaseModel):
-    """Admin mavjud xizmat turini tahrirlaydi (nomi, narxi, ikonkasi, holati)."""
+    """Admin mavjud xizmat turini tahrirlaydi (nomi, narxi, ikonkasi/rasmi, holati)."""
     name: Optional[str] = None
     price: Optional[float] = None
     icon: Optional[str] = None
+    image_url: Optional[str] = None
+    remove_image: Optional[bool] = None  # True bo'lsa, mavjud rasm o'chiriladi (ikonkaga qaytadi)
     is_active: Optional[bool] = None
 
 class ServiceOwnerTypeToggle(BaseModel):
@@ -981,6 +1031,14 @@ class PricingUpdate(BaseModel):
     fuel_price_ai98: Optional[float] = None
     fuel_price_ai100: Optional[float] = None
     fuel_price_hyperfuel: Optional[float] = None
+    # "Qo'shimcha xizmatlar" bandlari uchun rasm (base64 data-URL). Bo'lmasa,
+    # frontend standart ikonkani ko'rsatadi.
+    evacuator_image: Optional[str] = None
+    fuel_image: Optional[str] = None
+    carwash_locations_image: Optional[str] = None
+    gasstation_locations_image: Optional[str] = None
+    electric_delivery_image: Optional[str] = None
+    carwash_call_image: Optional[str] = None
 
 class PartnerLocationCreate(BaseModel):
     location_type: str  # "carwash" yoki "gasstation"
@@ -1710,7 +1768,7 @@ def list_active_service_types(db: Session = Depends(get_db)):
     """Barcha faol xizmat turlari (servis egalari tanlashi va foydalanuvchilar
     ko'rishi uchun ochiq ro'yxat)."""
     types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
-    return [{"id": t.id, "name": t.name, "price": t.price, "icon": t.icon} for t in types]
+    return [{"id": t.id, "name": t.name, "price": t.price, "icon": t.icon, "image_url": t.image_url} for t in types]
 
 @app.get("/api/service-owner/service-types")
 def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
@@ -1731,6 +1789,7 @@ def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
             "name": t.name,
             "price": t.price,
             "icon": t.icon,
+            "image_url": t.image_url,
             "is_selected": t.id in selected and selected[t.id].is_active,
         }
         for t in types
@@ -1791,7 +1850,7 @@ def admin_list_service_types(db: Session = Depends(get_db)):
     """Admin panelidagi xizmat turlari katalogi - faol va nofaol turlar ham chiqadi."""
     types = db.query(ServiceType).order_by(ServiceType.id.desc()).all()
     return [
-        {"id": t.id, "name": t.name, "price": t.price, "icon": t.icon, "is_active": t.is_active}
+        {"id": t.id, "name": t.name, "price": t.price, "icon": t.icon, "image_url": t.image_url, "is_active": t.is_active}
         for t in types
     ]
 
@@ -1804,11 +1863,14 @@ def admin_create_service_type(request: ServiceTypeCreate, db: Session = Depends(
     existing = db.query(ServiceType).filter(func.lower(ServiceType.name) == name.lower()).first()
     if existing:
         raise HTTPException(status_code=400, detail="Bu nomdagi xizmat turi allaqachon mavjud")
-    stype = ServiceType(name=name, price=request.price, icon=request.icon or "build", is_active=True)
+    stype = ServiceType(
+        name=name, price=request.price, icon=request.icon or "build",
+        image_url=request.image_url, is_active=True,
+    )
     db.add(stype)
     db.commit()
     db.refresh(stype)
-    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "is_active": stype.is_active}
+    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "image_url": stype.image_url, "is_active": stype.is_active}
 
 @app.put("/api/admin/service-types/{type_id}")
 def admin_update_service_type(type_id: int, request: ServiceTypeUpdate, db: Session = Depends(get_db)):
@@ -1824,6 +1886,10 @@ def admin_update_service_type(type_id: int, request: ServiceTypeUpdate, db: Sess
         stype.price = request.price
     if request.icon is not None:
         stype.icon = request.icon
+    if request.remove_image:
+        stype.image_url = None
+    elif request.image_url is not None:
+        stype.image_url = request.image_url
     if request.is_active is not None:
         stype.is_active = request.is_active
     db.commit()
@@ -1834,7 +1900,7 @@ def admin_update_service_type(type_id: int, request: ServiceTypeUpdate, db: Sess
         {"category": stype.name, "price": stype.price}, synchronize_session=False
     )
     db.commit()
-    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "is_active": stype.is_active}
+    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "image_url": stype.image_url, "is_active": stype.is_active}
 
 @app.delete("/api/admin/service-types/{type_id}")
 def admin_delete_service_type(type_id: int, db: Session = Depends(get_db)):
@@ -2366,7 +2432,13 @@ def get_service_detail(service_id: int, db: Session = Depends(get_db)):
         # Foydalanuvchiga faqat admin tomonidan tasdiqlangan (approved) xizmatlar
         # ko'rinadi - servis egasi yoki admin qo'shgan va tasdiqlangan xizmatlar.
         "categories": [
-            {"category": o.category, "price": o.price, "is_active": o.is_active}
+            {
+                "category": o.category,
+                "price": o.price,
+                "is_active": o.is_active,
+                "icon": o.service_type.icon if o.service_type else None,
+                "image_url": o.service_type.image_url if o.service_type else None,
+            }
             for o in service.services_offered
             if o.status == "approved"
         ],
@@ -3357,14 +3429,15 @@ def get_categories(db: Session = Depends(get_db)):
     Evakuator, Benzin dastavka va Avtoservislar - har doim mavjud bo'lgan, alohida
     provayder turlari, shuning uchun har doim ro'yxat boshida turadi.
     """
+    pricing = _get_or_create_pricing(db)
     result = [
-        {"id": "evacuator", "name": "Evakuator", "icon": "local_shipping"},
-        {"id": "fuel", "name": "Benzin yetkazish", "icon": "local_gas_station"},
+        {"id": "evacuator", "name": "Evakuator", "icon": "local_shipping", "image_url": pricing.evacuator_image},
+        {"id": "fuel", "name": "Benzin yetkazish", "icon": "local_gas_station", "image_url": pricing.fuel_image},
         {"id": "auto_service", "name": "Avtoservislar", "icon": "build"},
     ]
     types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
     for t in types:
-        result.append({"id": str(t.id), "name": t.name, "icon": t.icon or "build", "price": t.price})
+        result.append({"id": str(t.id), "name": t.name, "icon": t.icon or "build", "image_url": t.image_url, "price": t.price})
     return result
 
 # ---- Evakuator/benzin dastavka uchun GLOBAL narxlar ----
@@ -3421,6 +3494,12 @@ def get_pricing(db: Session = Depends(get_db)):
         "fuel_price_hyperfuel": pricing.fuel_price_hyperfuel,
         "electric_delivery_phone": pricing.electric_delivery_phone,
         "carwash_call_phone": pricing.carwash_call_phone,
+        "evacuator_image": pricing.evacuator_image,
+        "fuel_image": pricing.fuel_image,
+        "carwash_locations_image": pricing.carwash_locations_image,
+        "gasstation_locations_image": pricing.gasstation_locations_image,
+        "electric_delivery_image": pricing.electric_delivery_image,
+        "carwash_call_image": pricing.carwash_call_image,
         "fuel_types": [
             {"id": fid, "label": label, "price_per_liter": getattr(pricing, f"fuel_price_{fid}")}
             for fid, label in FUEL_TYPE_LABELS.items()
@@ -3451,6 +3530,18 @@ def admin_update_pricing(request: PricingUpdate, db: Session = Depends(get_db)):
         pricing.fuel_price_ai100 = request.fuel_price_ai100
     if request.fuel_price_hyperfuel is not None:
         pricing.fuel_price_hyperfuel = request.fuel_price_hyperfuel
+    if request.evacuator_image is not None:
+        pricing.evacuator_image = request.evacuator_image or None
+    if request.fuel_image is not None:
+        pricing.fuel_image = request.fuel_image or None
+    if request.carwash_locations_image is not None:
+        pricing.carwash_locations_image = request.carwash_locations_image or None
+    if request.gasstation_locations_image is not None:
+        pricing.gasstation_locations_image = request.gasstation_locations_image or None
+    if request.electric_delivery_image is not None:
+        pricing.electric_delivery_image = request.electric_delivery_image or None
+    if request.carwash_call_image is not None:
+        pricing.carwash_call_image = request.carwash_call_image or None
     db.commit()
     db.refresh(pricing)
     return {
@@ -3464,6 +3555,12 @@ def admin_update_pricing(request: PricingUpdate, db: Session = Depends(get_db)):
         "fuel_price_hyperfuel": pricing.fuel_price_hyperfuel,
         "electric_delivery_phone": pricing.electric_delivery_phone,
         "carwash_call_phone": pricing.carwash_call_phone,
+        "evacuator_image": pricing.evacuator_image,
+        "fuel_image": pricing.fuel_image,
+        "carwash_locations_image": pricing.carwash_locations_image,
+        "gasstation_locations_image": pricing.gasstation_locations_image,
+        "electric_delivery_image": pricing.electric_delivery_image,
+        "carwash_call_image": pricing.carwash_call_image,
     }
 
 # ============================================
