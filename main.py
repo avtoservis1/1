@@ -227,7 +227,9 @@ class ServiceType(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(200), nullable=False)  # xizmat turi nomi - admin belgilaydi
-    price = Column(Float, nullable=True)  # narxi - admin belgilaydi
+    price = Column(Float, nullable=True)  # ESKIRGAN: orqaga moslik uchun saqlanadi, endi price_sedan bilan bir xil qiymatda yuritiladi
+    price_sedan = Column(Float, nullable=True)  # Sedan uchun narx - admin belgilaydi
+    price_crossover = Column(Float, nullable=True)  # Krossover uchun narx - admin belgilaydi
     icon = Column(String(50), default="build")  # frontendda ko'rsatiladigan ikonka nomi (rasm bo'lmasa shu ko'rsatiladi)
     image_url = Column(Text, nullable=True)  # admin yuklagan rasm (base64 data-URL). Bo'lmasa, frontend `icon`ni ko'rsatadi.
     is_active = Column(Boolean, default=True)
@@ -940,16 +942,20 @@ class ServiceOfferedRejectRequest(BaseModel):
     reason: Optional[str] = None
 
 class ServiceTypeCreate(BaseModel):
-    """Admin yangi xizmat turi qo'shadi - nomi va narxini admin belgilaydi."""
+    """Admin yangi xizmat turi qo'shadi - nomi va narxlarini (sedan/krossover uchun
+    alohida-alohida) admin belgilaydi."""
     name: str
-    price: Optional[float] = None
+    price_sedan: Optional[float] = None
+    price_crossover: Optional[float] = None
     icon: Optional[str] = "build"
     image_url: Optional[str] = None  # admin yuklagan rasm (base64 data-URL)
 
 class ServiceTypeUpdate(BaseModel):
-    """Admin mavjud xizmat turini tahrirlaydi (nomi, narxi, ikonkasi/rasmi, holati)."""
+    """Admin mavjud xizmat turini tahrirlaydi (nomi, sedan/krossover narxlari,
+    ikonkasi/rasmi, holati)."""
     name: Optional[str] = None
-    price: Optional[float] = None
+    price_sedan: Optional[float] = None
+    price_crossover: Optional[float] = None
     icon: Optional[str] = None
     image_url: Optional[str] = None
     remove_image: Optional[bool] = None  # True bo'lsa, mavjud rasm o'chiriladi (ikonkaga qaytadi)
@@ -1768,7 +1774,15 @@ def list_active_service_types(db: Session = Depends(get_db)):
     """Barcha faol xizmat turlari (servis egalari tanlashi va foydalanuvchilar
     ko'rishi uchun ochiq ro'yxat)."""
     types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
-    return [{"id": t.id, "name": t.name, "price": t.price, "icon": t.icon, "image_url": t.image_url} for t in types]
+    return [
+        {
+            "id": t.id, "name": t.name,
+            "price": t.price_sedan,  # eskirgan maydon - orqaga moslik uchun (sedan narxiga teng)
+            "price_sedan": t.price_sedan, "price_crossover": t.price_crossover,
+            "icon": t.icon, "image_url": t.image_url,
+        }
+        for t in types
+    ]
 
 @app.get("/api/service-owner/service-types")
 def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
@@ -1787,7 +1801,9 @@ def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
         {
             "id": t.id,
             "name": t.name,
-            "price": t.price,
+            "price": t.price_sedan,  # eskirgan maydon - orqaga moslik uchun (sedan narxiga teng)
+            "price_sedan": t.price_sedan,
+            "price_crossover": t.price_crossover,
             "icon": t.icon,
             "image_url": t.image_url,
             "is_selected": t.id in selected and selected[t.id].is_active,
@@ -1817,7 +1833,7 @@ def toggle_service_type(owner_id: int, request: ServiceOwnerTypeToggle, db: Sess
     if item:
         item.is_active = request.is_active
         item.category = stype.name
-        item.price = stype.price
+        item.price = stype.price_sedan
         item.status = "approved"
         item.reject_reason = None
     else:
@@ -1825,7 +1841,7 @@ def toggle_service_type(owner_id: int, request: ServiceOwnerTypeToggle, db: Sess
             service_id=service.id,
             service_type_id=stype.id,
             category=stype.name,
-            price=stype.price,
+            price=stype.price_sedan,
             is_active=request.is_active,
             status="approved",
             added_by_admin=False,
@@ -1850,13 +1866,18 @@ def admin_list_service_types(db: Session = Depends(get_db)):
     """Admin panelidagi xizmat turlari katalogi - faol va nofaol turlar ham chiqadi."""
     types = db.query(ServiceType).order_by(ServiceType.id.desc()).all()
     return [
-        {"id": t.id, "name": t.name, "price": t.price, "icon": t.icon, "image_url": t.image_url, "is_active": t.is_active}
+        {
+            "id": t.id, "name": t.name,
+            "price": t.price_sedan,  # eskirgan maydon - orqaga moslik uchun (sedan narxiga teng)
+            "price_sedan": t.price_sedan, "price_crossover": t.price_crossover,
+            "icon": t.icon, "image_url": t.image_url, "is_active": t.is_active,
+        }
         for t in types
     ]
 
 @app.post("/api/admin/service-types")
 def admin_create_service_type(request: ServiceTypeCreate, db: Session = Depends(get_db)):
-    """Admin yangi xizmat turi (nomi va narxi bilan) qo'shadi."""
+    """Admin yangi xizmat turi qo'shadi - nomi va sedan/krossover uchun alohida narxlari bilan."""
     name = request.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Xizmat turi nomi bo'sh bo'lishi mumkin emas")
@@ -1864,17 +1885,25 @@ def admin_create_service_type(request: ServiceTypeCreate, db: Session = Depends(
     if existing:
         raise HTTPException(status_code=400, detail="Bu nomdagi xizmat turi allaqachon mavjud")
     stype = ServiceType(
-        name=name, price=request.price, icon=request.icon or "build",
+        name=name,
+        price=request.price_sedan,  # eskirgan maydon - orqaga moslik uchun
+        price_sedan=request.price_sedan,
+        price_crossover=request.price_crossover,
+        icon=request.icon or "build",
         image_url=request.image_url, is_active=True,
     )
     db.add(stype)
     db.commit()
     db.refresh(stype)
-    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "image_url": stype.image_url, "is_active": stype.is_active}
+    return {
+        "id": stype.id, "name": stype.name,
+        "price": stype.price_sedan, "price_sedan": stype.price_sedan, "price_crossover": stype.price_crossover,
+        "icon": stype.icon, "image_url": stype.image_url, "is_active": stype.is_active,
+    }
 
 @app.put("/api/admin/service-types/{type_id}")
 def admin_update_service_type(type_id: int, request: ServiceTypeUpdate, db: Session = Depends(get_db)):
-    """Admin mavjud xizmat turini (nomi/narxi/ikonkasi/holati) tahrirlaydi.
+    """Admin mavjud xizmat turini (nomi/sedan va krossover narxlari/ikonkasi/holati) tahrirlaydi.
     O'zgarish shu turni tanlagan barcha servislarga ham darhol qo'llanadi."""
     stype = db.query(ServiceType).filter(ServiceType.id == type_id).first()
     if not stype:
@@ -1882,8 +1911,11 @@ def admin_update_service_type(type_id: int, request: ServiceTypeUpdate, db: Sess
 
     if request.name is not None and request.name.strip():
         stype.name = request.name.strip()
-    if request.price is not None:
-        stype.price = request.price
+    if request.price_sedan is not None:
+        stype.price_sedan = request.price_sedan
+        stype.price = request.price_sedan  # eskirgan maydon - orqaga moslik uchun
+    if request.price_crossover is not None:
+        stype.price_crossover = request.price_crossover
     if request.icon is not None:
         stype.icon = request.icon
     if request.remove_image:
@@ -1897,10 +1929,14 @@ def admin_update_service_type(type_id: int, request: ServiceTypeUpdate, db: Sess
 
     # Bu turni tanlagan servislardagi nomi/narxini ham katalog bilan sinxronlaymiz
     db.query(ServiceOffered).filter(ServiceOffered.service_type_id == stype.id).update(
-        {"category": stype.name, "price": stype.price}, synchronize_session=False
+        {"category": stype.name, "price": stype.price_sedan}, synchronize_session=False
     )
     db.commit()
-    return {"id": stype.id, "name": stype.name, "price": stype.price, "icon": stype.icon, "image_url": stype.image_url, "is_active": stype.is_active}
+    return {
+        "id": stype.id, "name": stype.name,
+        "price": stype.price_sedan, "price_sedan": stype.price_sedan, "price_crossover": stype.price_crossover,
+        "icon": stype.icon, "image_url": stype.image_url, "is_active": stype.is_active,
+    }
 
 @app.delete("/api/admin/service-types/{type_id}")
 def admin_delete_service_type(type_id: int, db: Session = Depends(get_db)):
@@ -3437,7 +3473,11 @@ def get_categories(db: Session = Depends(get_db)):
     ]
     types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
     for t in types:
-        result.append({"id": str(t.id), "name": t.name, "icon": t.icon or "build", "image_url": t.image_url, "price": t.price})
+        result.append({
+            "id": str(t.id), "name": t.name, "icon": t.icon or "build", "image_url": t.image_url,
+            "price": t.price_sedan,  # eskirgan maydon - orqaga moslik uchun (sedan narxiga teng)
+            "price_sedan": t.price_sedan, "price_crossover": t.price_crossover,
+        })
     return result
 
 # ---- Evakuator/benzin dastavka uchun GLOBAL narxlar ----
