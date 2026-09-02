@@ -1772,17 +1772,30 @@ def delete_service_offered(item_id: int, db: Session = Depends(get_db)):
 @app.get("/api/service-types")
 def list_active_service_types(db: Session = Depends(get_db)):
     """Barcha faol xizmat turlari (servis egalari tanlashi va foydalanuvchilar
-    ko'rishi uchun ochiq ro'yxat)."""
+    ko'rishi uchun ochiq ro'yxat). Ro'yxat tezkor ochilishi uchun rasmning o'zi
+    emas, faqat `has_image` belgisi qaytariladi - rasm kerak bo'lganda
+    /api/service-types/{id}/image orqali alohida-alohida so'raladi."""
     types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
     return [
         {
             "id": t.id, "name": t.name,
             "price": t.price_sedan,  # eskirgan maydon - orqaga moslik uchun (sedan narxiga teng)
             "price_sedan": t.price_sedan, "price_crossover": t.price_crossover,
-            "icon": t.icon, "image_url": t.image_url,
+            "icon": t.icon, "has_image": bool(t.image_url),
         }
         for t in types
     ]
+
+@app.get("/api/service-types/{type_id}/image")
+def get_service_type_image(type_id: int, db: Session = Depends(get_db)):
+    """Xizmat turi rasmini alohida-alohida (lazy) yuklab olish uchun. Ro'yxat
+    (/api/categories, /api/service-types, /api/service-owner/service-types,
+    /api/admin/service-types) tezkor ochilishi uchun rasmni o'zida saqlamaydi -
+    har bir qator uchun rasm shu endpoint orqali fonda so'raladi."""
+    stype = db.query(ServiceType).filter(ServiceType.id == type_id).first()
+    if not stype:
+        raise HTTPException(status_code=404, detail="Xizmat turi topilmadi")
+    return {"image_url": stype.image_url}
 
 @app.get("/api/service-owner/service-types")
 def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
@@ -1805,7 +1818,7 @@ def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
             "price_sedan": t.price_sedan,
             "price_crossover": t.price_crossover,
             "icon": t.icon,
-            "image_url": t.image_url,
+            "has_image": bool(t.image_url),
             "is_selected": t.id in selected and selected[t.id].is_active,
         }
         for t in types
@@ -1870,7 +1883,7 @@ def admin_list_service_types(db: Session = Depends(get_db)):
             "id": t.id, "name": t.name,
             "price": t.price_sedan,  # eskirgan maydon - orqaga moslik uchun (sedan narxiga teng)
             "price_sedan": t.price_sedan, "price_crossover": t.price_crossover,
-            "icon": t.icon, "image_url": t.image_url, "is_active": t.is_active,
+            "icon": t.icon, "has_image": bool(t.image_url), "is_active": t.is_active,
         }
         for t in types
     ]
@@ -3474,7 +3487,8 @@ def get_categories(db: Session = Depends(get_db)):
     types = db.query(ServiceType).filter(ServiceType.is_active == True).order_by(ServiceType.id.asc()).all()
     for t in types:
         result.append({
-            "id": str(t.id), "name": t.name, "icon": t.icon or "build", "image_url": t.image_url,
+            "id": str(t.id), "name": t.name, "icon": t.icon or "build",
+            "has_image": bool(t.image_url),
             "price": t.price_sedan,  # eskirgan maydon - orqaga moslik uchun (sedan narxiga teng)
             "price_sedan": t.price_sedan, "price_crossover": t.price_crossover,
         })
