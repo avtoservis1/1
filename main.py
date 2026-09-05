@@ -2194,6 +2194,22 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             "role": user.role
         }
 
+    # Apple App Store Connect reviewerlari uchun maxsus test raqami:
+    # bu raqam bilan kirishda SMS/OTP bosqichi butunlay o'tkazib yuboriladi,
+    # chunki reviewer haqiqiy SMS kodini ololmaydi. Admin panelga kirish
+    # ham xuddi shu sababdan SMS talab qilmaydi (yuqorida).
+    APPLE_REVIEW_TEST_PHONE = "+99889791007"
+    if user.phone == APPLE_REVIEW_TEST_PHONE:
+        token = generate_token(user.id)
+        return {
+            "success": True,
+            "token": token,
+            "user_id": user.id,
+            "name": user.name,
+            "phone": user.phone,
+            "role": user.role
+        }
+
     # Yangi login oqimi: mijoz/provayder ilovasi parolni so'rashdan OLDIN
     # /api/send-otp + /api/verify-otp orqali telefon raqamni allaqachon SMS
     # bilan tasdiqlagan bo'ladi. Bunday holda qayta SMS yuborib, foydalanuvchini
