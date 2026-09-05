@@ -2198,7 +2198,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     # bu raqam bilan kirishda SMS/OTP bosqichi butunlay o'tkazib yuboriladi,
     # chunki reviewer haqiqiy SMS kodini ololmaydi. Admin panelga kirish
     # ham xuddi shu sababdan SMS talab qilmaydi (yuqorida).
-    APPLE_REVIEW_TEST_PHONE = "+99889791007"
+    APPLE_REVIEW_TEST_PHONE = "+998889791007"
     if user.phone == APPLE_REVIEW_TEST_PHONE:
         token = generate_token(user.id)
         return {
