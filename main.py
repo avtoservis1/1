@@ -69,7 +69,7 @@ else:
 
 def send_push_notification(token: Optional[str], title: str, body: str, data: Optional[dict] = None):
     """
-    Android qurilmasiga real push bildirishnoma yuboradi (Firebase FCM orqali).
+    Qurilmaga real push bildirishnoma yuboradi (Firebase FCM orqali).
     Token bo'lmasa yoki Firebase sozlanmagan bo'lsa, jimgina hech narsa qilmaydi -
     bu asosiy amalni (buyurtma yaratish va h.k.) hech qachon buzmasligi kerak.
     """
@@ -85,6 +85,19 @@ def send_push_notification(token: Optional[str], title: str, body: str, data: Op
                 notification=messaging.AndroidNotification(
                     channel_id="autoservis_default",
                     sound="default",
+                ),
+            ),
+            # iOS (APNs) uchun maxsus sozlama - bu bo'lmasa, avvalgi holatda
+            # faqat Android tomon to'liq ishonchli ishlar edi, iOS'da push
+            # ekranga chiqmasligi yoki kechikishi mumkin edi.
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        alert=messaging.ApsAlert(title=title, body=body),
+                        sound="default",
+                        content_available=True,
+                        mutable_content=True,
+                    ),
                 ),
             ),
         )
