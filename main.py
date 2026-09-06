@@ -1103,7 +1103,8 @@ def generate_otp() -> str:
 # lekin bularni faqat tekshiruv/test uchun ishlating, productionda unutmang.
 TEST_PHONE_NUMBERS = {
     "+998900000001",
-    "+998889791007",  # Apple App Store Connect reviewer test raqami
+    "+998889791007",  # Apple App Store Connect reviewer test raqami (user)
+    "+998889791000",  # Apple App Store Connect reviewer test raqami (owner)
 }
 TEST_OTP_CODE = "1111"
 
