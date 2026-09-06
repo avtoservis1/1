@@ -1103,6 +1103,7 @@ def generate_otp() -> str:
 # lekin bularni faqat tekshiruv/test uchun ishlating, productionda unutmang.
 TEST_PHONE_NUMBERS = {
     "+998900000001",
+    "+998889791007",  # Apple App Store Connect reviewer test raqami
 }
 TEST_OTP_CODE = "1111"
 
@@ -1532,6 +1533,18 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
             ))
         if stypes:
             db.commit()
+
+    # Yangi ariza kelganini barcha adminlarga push notification orqali xabar
+    # qilamiz - avval bu qadam yo'q edi, shuning uchun adminga bildirishnoma
+    # kelmas edi.
+    admins = db.query(User).filter(User.role == UserRole.ADMIN.value).all()
+    for admin_user in admins:
+        create_notification(
+            db, admin_user.id,
+            "Yangi ariza",
+            f"{display_name} servis sifatida ro'yxatdan o'tishga ariza berdi.",
+            type="new_application", related_id=service.id,
+        )
 
     token = generate_token(user.id)
 
@@ -2184,22 +2197,6 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 
     # Admin panelga kirishda SMS talab qilinmaydi.
     if user.role == UserRole.ADMIN.value:
-        token = generate_token(user.id)
-        return {
-            "success": True,
-            "token": token,
-            "user_id": user.id,
-            "name": user.name,
-            "phone": user.phone,
-            "role": user.role
-        }
-
-    # Apple App Store Connect reviewerlari uchun maxsus test raqami:
-    # bu raqam bilan kirishda SMS/OTP bosqichi butunlay o'tkazib yuboriladi,
-    # chunki reviewer haqiqiy SMS kodini ololmaydi. Admin panelga kirish
-    # ham xuddi shu sababdan SMS talab qilmaydi (yuqorida).
-    APPLE_REVIEW_TEST_PHONE = "+998889791007"
-    if user.phone == APPLE_REVIEW_TEST_PHONE:
         token = generate_token(user.id)
         return {
             "success": True,
@@ -2902,18 +2899,27 @@ def admin_dashboard(db: Session = Depends(get_db)):
 @app.get("/api/admin/users")
 def admin_get_users(db: Session = Depends(get_db)):
     users = db.query(User).all()
-    return [
-        {
+    # Servis egalari uchun ular ro'yxatdan o'tgan xizmat turini (masalan
+    # "benzin dastavka", "evakuator") ham qo'shamiz - aks holda admin
+    # panelida hammasi bir xilda "Servis egasi" deb ko'rinib qolar edi.
+    result = []
+    for u in users:
+        provider_type = None
+        if u.role == UserRole.SERVICE_OWNER.value:
+            own_service = db.query(Service).filter(Service.owner_id == u.id).first()
+            if own_service:
+                provider_type = own_service.provider_type
+        result.append({
             "id": u.id,
             "name": u.name,
             "phone": u.phone,
             "role": u.role,
+            "provider_type": provider_type,
             "is_active": u.is_active,
             "created_at": u.created_at,
             "order_count": len(u.orders)
-        }
-        for u in users
-    ]
+        })
+    return result
 
 @app.get("/api/admin/users/{user_id}")
 def admin_get_user_detail(user_id: int, db: Session = Depends(get_db)):
