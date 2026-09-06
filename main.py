@@ -2221,6 +2221,22 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
             "role": user.role
         }
 
+    # Apple/Google reviewer va QA uchun test raqamlari: ular ilovada telefon
+    # tasdiqlash bosqichini (SMS) umuman ko'rmaydi (frontend buni o'tkazib
+    # yuboradi), shuning uchun bu yerda ham login-tasdiqlash SMS'i so'ralmasligi
+    # kerak - aks holda parol to'g'ri kiritilgach ham foydalanuvchi hech qachon
+    # ololmaydigan SMS kodini kutib qoladi. Token darhol beriladi.
+    if user.phone in TEST_PHONE_NUMBERS:
+        token = generate_token(user.id)
+        return {
+            "success": True,
+            "token": token,
+            "user_id": user.id,
+            "name": user.name,
+            "phone": user.phone,
+            "role": user.role
+        }
+
     # Yangi login oqimi: mijoz/provayder ilovasi parolni so'rashdan OLDIN
     # /api/send-otp + /api/verify-otp orqali telefon raqamni allaqachon SMS
     # bilan tasdiqlagan bo'ladi. Bunday holda qayta SMS yuborib, foydalanuvchini
