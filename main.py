@@ -943,6 +943,12 @@ class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str = Field(..., min_length=6)
 
+class DeleteAccountRequest(BaseModel):
+    """Apple/Google talabi: foydalanuvchi ilova ichidan o'z akkauntini
+    o'chira olishi shart. Xavfsizlik uchun joriy parol qayta so'raladi."""
+    user_id: int
+    password: str
+
 class ServiceOfferedUpsert(BaseModel):
     """Servis egasi 'Xizmatlarni boshqarish' bo'limida yangi xizmat (erkin nomli)
     qo'shadi yoki mavjudining narxi/holatini yangilaydi. Yangi xizmat har doim
@@ -2323,6 +2329,43 @@ def change_password(request: ChangePasswordRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=401, detail="Joriy parol noto'g'ri")
 
     user.password_hash = hash_password(request.new_password)
+    db.commit()
+
+    return {"success": True}
+
+@app.post("/api/delete-account")
+def delete_account(request: DeleteAccountRequest, db: Session = Depends(get_db)):
+    """Foydalanuvchi o'z akkauntini o'chiradi (Apple Guideline 5.1.1(v) va Google
+    Play talabi - ro'yxatdan o'tish imkoni bo'lgan har qanday ilova akkauntni
+    ilova ichidan o'chirish imkonini berishi shart). Xavfsizlik uchun joriy
+    parol qayta so'raladi.
+
+    Sof shaxsiy va boshqa hech kimga tegishli bo'lmagan ma'lumotlar (mashinalar,
+    sevimlilar) butunlay o'chiriladi. Buyurtmalar va sharhlar esa saqlanib
+    qoladi (ular boshqa tomon - servis egasi/admin - hisobotlari va moliyaviy
+    yozuvlarining bir qismi), lekin ular endi bu shaxsga bog'lanmaydi: ism,
+    telefon, avatar va boshqa shaxsni aniqlovchi ma'lumotlar tozalanadi,
+    parol tasodifiy qiymatga almashtiriladi va hisob bloklanadi (is_active
+    = False), shu bilan akkauntga qayta kirish imkonsiz bo'ladi.
+    """
+    user = db.query(User).filter(User.id == request.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
+    if user.password_hash != hash_password(request.password):
+        raise HTTPException(status_code=401, detail="Parol noto'g'ri")
+
+    db.query(Car).filter(Car.user_id == user.id).delete()
+    db.query(Favorite).filter(Favorite.user_id == user.id).delete()
+
+    user.name = "O'chirilgan foydalanuvchi"
+    # Telefon ham anonimlashtiriladi (unique constraint saqlanib qoladi va
+    # foydalanuvchi xohlasa xuddi shu raqam bilan yangidan ro'yxatdan o'ta oladi).
+    user.phone = f"deleted_{user.id}_{int(datetime.datetime.utcnow().timestamp())}"
+    user.avatar_url = None
+    user.fcm_token = None
+    user.city = None
+    user.password_hash = hash_password(os.urandom(16).hex())
+    user.is_active = False
     db.commit()
 
     return {"success": True}
