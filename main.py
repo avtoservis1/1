@@ -2335,45 +2335,73 @@ def change_password(request: ChangePasswordRequest, db: Session = Depends(get_db
 
 def _perform_account_deletion(user: "User", db: Session):
     """Ikkala flow (ilova ichidan /api/delete-account va tashqi veb-sahifa
-    /api/public/delete-account) uchun umumiy o'chirish/anonimlashtirish
-    logikasi. Chaqiruvchi tomon parolni oldindan tekshirgan bo'lishi kerak."""
-    db.query(Car).filter(Car.user_id == user.id).delete()
-    db.query(Favorite).filter(Favorite.user_id == user.id).delete()
+    /api/public/delete-account) uchun umumiy TO'LIQ (hard) o'chirish logikasi.
+    Chaqiruvchi tomon parolni oldindan tekshirgan bo'lishi kerak.
 
-    # Servis egasi o'z akkauntini o'chirsa, uning servis e'loni ham
-    # ilovada (xaritada, ro'yxatlarda) ko'rinmay qolishi kerak.
+    Foydalanuvchiga tegishli BARCHA ma'lumotlar bazadan butunlay o'chiriladi:
+    mashinalar, sevimlilar, bildirishnomalar, u yozgan sharhlar, u qatnashgan
+    chat xabarlari va buyurtmalar. Agar bu servis egasi bo'lsa - uning
+    servisi (e'loni) va o'sha servisga tegishli BARCHA buyurtmalar/sharhlar/
+    chat xabarlari ham (boshqa mijozlarnikini ham) o'chiriladi, chunki ular
+    endi mavjud bo'lmagan servisga bog'liq. Bu amalni ortga qaytarib
+    bo'lmaydi.
+    """
+    # 1) Ushbu foydalanuvchi mijoz sifatida qatnashgan buyurtmalar.
+    order_ids = {r[0] for r in db.query(Order.id).filter(Order.user_id == user.id).all()}
+
+    # 2) Agar servis egasi bo'lsa - uning servis(lar)i va o'sha servisga
+    # tegishli barcha buyurtmalar (boshqa mijozlarniki ham) aniqlanadi.
+    service_ids = []
     if user.role == UserRole.SERVICE_OWNER.value:
-        db.query(Service).filter(Service.owner_id == user.id).update(
-            {"is_active": False, "is_online": False}
-        )
+        service_ids = [r[0] for r in db.query(Service.id).filter(Service.owner_id == user.id).all()]
+        if service_ids:
+            order_ids |= {r[0] for r in db.query(Order.id).filter(Order.service_id.in_(service_ids)).all()}
 
-    user.name = "O'chirilgan foydalanuvchi"
-    # Telefon ham anonimlashtiriladi (unique constraint saqlanib qoladi va
-    # foydalanuvchi xohlasa xuddi shu raqam bilan yangidan ro'yxatdan o'ta oladi).
-    user.phone = f"deleted_{user.id}_{int(datetime.datetime.utcnow().timestamp())}"
-    user.avatar_url = None
-    user.fcm_token = None
-    user.city = None
-    user.password_hash = hash_password(os.urandom(16).hex())
-    user.is_active = False
+    order_ids = list(order_ids)
+
+    # 3) Yuqoridagi buyurtmalarga bog'liq chat xabarlari va sharhlar (FK
+    # xatosiga yo'l qo'ymaslik uchun Order'dan OLDIN o'chiriladi).
+    if order_ids:
+        db.query(ChatMessage).filter(ChatMessage.order_id.in_(order_ids)).delete(synchronize_session=False)
+        db.query(Review).filter(Review.order_id.in_(order_ids)).delete(synchronize_session=False)
+
+    # 4) Ehtiyot chorasi: yuqoridagi order_id bo'yicha qamrab olinmagan,
+    # lekin shu foydalanuvchi yozgan/yuborgan qoldiq yozuvlar.
+    db.query(ChatMessage).filter(ChatMessage.sender_id == user.id).delete(synchronize_session=False)
+    db.query(Review).filter(Review.user_id == user.id).delete(synchronize_session=False)
+
+    # 5) Foydalanuvchiga bevosita tegishli boshqa jadvallar.
+    db.query(Favorite).filter(Favorite.user_id == user.id).delete(synchronize_session=False)
+    db.query(Car).filter(Car.user_id == user.id).delete(synchronize_session=False)
+    db.query(Notification).filter(Notification.user_id == user.id).delete(synchronize_session=False)
+
+    # 6) Endi buyurtmalarning o'zini o'chirish mumkin (chat/sharh allaqachon tozalandi).
+    if order_ids:
+        db.query(Order).filter(Order.id.in_(order_ids)).delete(synchronize_session=False)
+
+    # 7) Servis egasi bo'lsa - servisiga bog'liq qolgan yozuvlar va servisning o'zi.
+    if service_ids:
+        db.query(Favorite).filter(Favorite.service_id.in_(service_ids)).delete(synchronize_session=False)
+        db.query(ServiceOffered).filter(ServiceOffered.service_id.in_(service_ids)).delete(synchronize_session=False)
+        db.query(Service).filter(Service.id.in_(service_ids)).delete(synchronize_session=False)
+
+    # 8) Shu telefon raqamiga tegishli eskirgan/ishlatilmagan OTP kodlari.
+    db.query(OTPCode).filter(OTPCode.phone == user.phone).delete(synchronize_session=False)
+
+    # 9) Foydalanuvchi yozuvining o'zi.
+    db.delete(user)
     db.commit()
+
 
 
 @app.post("/api/delete-account")
 def delete_account(request: DeleteAccountRequest, db: Session = Depends(get_db)):
-    """Foydalanuvchi o'z akkauntini ilova ichidan o'chiradi (Apple Guideline
-    5.1.1(v) va Google Play talabi - ro'yxatdan o'tish imkoni bo'lgan har
-    qanday ilova akkauntni ilova ichidan o'chirish imkonini berishi shart).
-    Xavfsizlik uchun joriy parol qayta so'raladi.
-
-    Sof shaxsiy va boshqa hech kimga tegishli bo'lmagan ma'lumotlar (mashinalar,
-    sevimlilar) butunlay o'chiriladi. Buyurtmalar va sharhlar esa saqlanib
-    qoladi (ular boshqa tomon - servis egasi/admin - hisobotlari va moliyaviy
-    yozuvlarining bir qismi), lekin ular endi bu shaxsga bog'lanmaydi: ism,
-    telefon, avatar va boshqa shaxsni aniqlovchi ma'lumotlar tozalanadi,
-    parol tasodifiy qiymatga almashtiriladi va hisob bloklanadi (is_active
-    = False), shu bilan akkauntga qayta kirish imkonsiz bo'ladi.
-    """
+    """Foydalanuvchi o'z akkauntini ilova ichidan TO'LIQ o'chiradi (Apple
+    Guideline 5.1.1(v) va Google Play talabi). Xavfsizlik uchun joriy parol
+    qayta so'raladi. Barcha ma'lumotlar (profil, mashinalar, sevimlilar,
+    buyurtmalar, sharhlar, chat xabarlari, servis egasi bo'lsa - servisining
+    o'zi ham) bazadan butunlay o'chiriladi. Bu amalni ortga qaytarib
+    bo'lmaydi."""
     user = db.query(User).filter(User.id == request.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
@@ -2391,8 +2419,9 @@ def public_delete_account(request: LoginRequest, db: Session = Depends(get_db)):
     kira olmaydigan bo'lsa ham, ilova hech bo'lmaganda tashqi VEB sahifa orqali
     akkaunt o'chirishni so'ray olishi shart. Bu endpoint /delete-account veb
     sahifasi tomonidan chaqiriladi - telefon raqami + parol orqali (xuddi
-    login kabi) foydalanuvchini aniqlaydi va akkauntini o'chiradi/anonim-
-    lashtiradi. LoginRequest bilan bir xil (phone, password) shakl ishlatiladi.
+    login kabi) foydalanuvchini aniqlaydi va akkauntini/barcha ma'lumotlarini
+    TO'LIQ o'chiradi. LoginRequest bilan bir xil (phone, password) shakl
+    ishlatiladi.
     """
     user = db.query(User).filter(User.phone == request.phone).first()
     if not user or not user.is_active:
@@ -2458,7 +2487,7 @@ def delete_account_page():
     <h1>Akkauntni o'chirish</h1>
     <p class="sub">GoFix ilovasidagi akkauntingizni va unga bog'liq shaxsiy ma'lumotlaringizni o'chirish uchun quyidagi ma'lumotlarni kiriting.</p>
     <div class="warn">
-      Diqqat: bu amalni ortga qaytarib bo'lmaydi. Shaxsiy ma'lumotlaringiz (ism, telefon, rasm) tozalanadi, akkaunt bloklanadi va servis egasi bo'lsangiz, e'loningiz ilovadan yashiriladi.
+      Diqqat: bu amalni ortga qaytarib bo'lmaydi. Profilingiz, mashinalaringiz, buyurtmalar tarixi, sharhlaringiz va chat yozishmalaringiz bazadan butunlay o'chiriladi. Servis egasi bo'lsangiz, servisingiz (e'loningiz) va unga tegishli barcha buyurtmalar/sharhlar ham butunlay o'chiriladi.
     </div>
     <form id="delForm">
       <label for="phone">Telefon raqam</label>
