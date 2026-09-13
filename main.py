@@ -1289,7 +1289,7 @@ app.add_middleware(
 # to find instead of guessing from the frontend.
 import logging
 import traceback
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -2333,12 +2333,38 @@ def change_password(request: ChangePasswordRequest, db: Session = Depends(get_db
 
     return {"success": True}
 
+def _perform_account_deletion(user: "User", db: Session):
+    """Ikkala flow (ilova ichidan /api/delete-account va tashqi veb-sahifa
+    /api/public/delete-account) uchun umumiy o'chirish/anonimlashtirish
+    logikasi. Chaqiruvchi tomon parolni oldindan tekshirgan bo'lishi kerak."""
+    db.query(Car).filter(Car.user_id == user.id).delete()
+    db.query(Favorite).filter(Favorite.user_id == user.id).delete()
+
+    # Servis egasi o'z akkauntini o'chirsa, uning servis e'loni ham
+    # ilovada (xaritada, ro'yxatlarda) ko'rinmay qolishi kerak.
+    if user.role == UserRole.SERVICE_OWNER.value:
+        db.query(Service).filter(Service.owner_id == user.id).update(
+            {"is_active": False, "is_online": False}
+        )
+
+    user.name = "O'chirilgan foydalanuvchi"
+    # Telefon ham anonimlashtiriladi (unique constraint saqlanib qoladi va
+    # foydalanuvchi xohlasa xuddi shu raqam bilan yangidan ro'yxatdan o'ta oladi).
+    user.phone = f"deleted_{user.id}_{int(datetime.datetime.utcnow().timestamp())}"
+    user.avatar_url = None
+    user.fcm_token = None
+    user.city = None
+    user.password_hash = hash_password(os.urandom(16).hex())
+    user.is_active = False
+    db.commit()
+
+
 @app.post("/api/delete-account")
 def delete_account(request: DeleteAccountRequest, db: Session = Depends(get_db)):
-    """Foydalanuvchi o'z akkauntini o'chiradi (Apple Guideline 5.1.1(v) va Google
-    Play talabi - ro'yxatdan o'tish imkoni bo'lgan har qanday ilova akkauntni
-    ilova ichidan o'chirish imkonini berishi shart). Xavfsizlik uchun joriy
-    parol qayta so'raladi.
+    """Foydalanuvchi o'z akkauntini ilova ichidan o'chiradi (Apple Guideline
+    5.1.1(v) va Google Play talabi - ro'yxatdan o'tish imkoni bo'lgan har
+    qanday ilova akkauntni ilova ichidan o'chirish imkonini berishi shart).
+    Xavfsizlik uchun joriy parol qayta so'raladi.
 
     Sof shaxsiy va boshqa hech kimga tegishli bo'lmagan ma'lumotlar (mashinalar,
     sevimlilar) butunlay o'chiriladi. Buyurtmalar va sharhlar esa saqlanib
@@ -2354,21 +2380,134 @@ def delete_account(request: DeleteAccountRequest, db: Session = Depends(get_db))
     if user.password_hash != hash_password(request.password):
         raise HTTPException(status_code=401, detail="Parol noto'g'ri")
 
-    db.query(Car).filter(Car.user_id == user.id).delete()
-    db.query(Favorite).filter(Favorite.user_id == user.id).delete()
-
-    user.name = "O'chirilgan foydalanuvchi"
-    # Telefon ham anonimlashtiriladi (unique constraint saqlanib qoladi va
-    # foydalanuvchi xohlasa xuddi shu raqam bilan yangidan ro'yxatdan o'ta oladi).
-    user.phone = f"deleted_{user.id}_{int(datetime.datetime.utcnow().timestamp())}"
-    user.avatar_url = None
-    user.fcm_token = None
-    user.city = None
-    user.password_hash = hash_password(os.urandom(16).hex())
-    user.is_active = False
-    db.commit()
+    _perform_account_deletion(user, db)
 
     return {"success": True}
+
+
+@app.post("/api/public/delete-account")
+def public_delete_account(request: LoginRequest, db: Session = Depends(get_db)):
+    """Google Play talabi: foydalanuvchi ilovani o'chirib tashlagan yoki unga
+    kira olmaydigan bo'lsa ham, ilova hech bo'lmaganda tashqi VEB sahifa orqali
+    akkaunt o'chirishni so'ray olishi shart. Bu endpoint /delete-account veb
+    sahifasi tomonidan chaqiriladi - telefon raqami + parol orqali (xuddi
+    login kabi) foydalanuvchini aniqlaydi va akkauntini o'chiradi/anonim-
+    lashtiradi. LoginRequest bilan bir xil (phone, password) shakl ishlatiladi.
+    """
+    user = db.query(User).filter(User.phone == request.phone).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=401, detail="Telefon raqam yoki parol noto'g'ri")
+    if user.password_hash != hash_password(request.password):
+        raise HTTPException(
+            status_code=401, detail="Telefon raqam yoki parol noto'g'ri")
+
+    _perform_account_deletion(user, db)
+
+    return {"success": True}
+
+
+@app.get("/delete-account", response_class=HTMLResponse)
+def delete_account_page():
+    """Play Console 'Data safety' formasida ko'rsatiladigan ommaviy veb sahifa:
+    foydalanuvchi ilovani o'rnatmagan yoki kira olmagan taqdirda ham shu yerdan
+    akkaunt o'chirishni so'rashi mumkin. /api/public/delete-account ga fetch
+    orqali murojaat qiladi."""
+    return """<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GoFix — Akkauntni o'chirish</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    background: #F5F6F8; margin: 0; padding: 24px 16px;
+    display: flex; justify-content: center;
+  }
+  .card {
+    background: #fff; max-width: 420px; width: 100%;
+    border-radius: 18px; padding: 28px 24px;
+    box-shadow: 0 2px 16px rgba(0,0,0,0.06);
+  }
+  h1 { font-size: 20px; margin: 0 0 6px; color: #1A1A2E; }
+  p.sub { color: #6B7280; font-size: 14px; margin: 0 0 20px; line-height: 1.5; }
+  .warn {
+    background: #FDECEC; color: #D92D20; font-size: 13.5px;
+    padding: 12px 14px; border-radius: 12px; margin-bottom: 20px; line-height: 1.45;
+  }
+  label { display: block; font-size: 13.5px; font-weight: 600; color: #1A1A2E; margin: 14px 0 6px; }
+  input {
+    width: 100%; padding: 12px 14px; border: 1px solid #E5E7EB; border-radius: 12px;
+    font-size: 15px; outline: none;
+  }
+  input:focus { border-color: #0175C2; }
+  button {
+    width: 100%; margin-top: 22px; padding: 14px; border: none; border-radius: 14px;
+    background: #D92D20; color: #fff; font-size: 15px; font-weight: 700; cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  #msg { margin-top: 14px; font-size: 13.5px; text-align: center; }
+  #msg.ok { color: #067647; }
+  #msg.err { color: #D92D20; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Akkauntni o'chirish</h1>
+    <p class="sub">GoFix ilovasidagi akkauntingizni va unga bog'liq shaxsiy ma'lumotlaringizni o'chirish uchun quyidagi ma'lumotlarni kiriting.</p>
+    <div class="warn">
+      Diqqat: bu amalni ortga qaytarib bo'lmaydi. Shaxsiy ma'lumotlaringiz (ism, telefon, rasm) tozalanadi, akkaunt bloklanadi va servis egasi bo'lsangiz, e'loningiz ilovadan yashiriladi.
+    </div>
+    <form id="delForm">
+      <label for="phone">Telefon raqam</label>
+      <input id="phone" type="tel" placeholder="+998901234567" required>
+      <label for="password">Parol</label>
+      <input id="password" type="password" placeholder="••••••" required>
+      <button id="submitBtn" type="submit">Akkauntni butunlay o'chirish</button>
+    </form>
+    <div id="msg"></div>
+  </div>
+<script>
+document.getElementById('delForm').addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const phone = document.getElementById('phone').value.trim();
+  const password = document.getElementById('password').value;
+  const btn = document.getElementById('submitBtn');
+  const msg = document.getElementById('msg');
+  msg.textContent = ''; msg.className = '';
+
+  if (!confirm('Akkauntingizni butunlay o\\'chirmoqchimisiz? Bu amalni ortga qaytarib bo\\'lmaydi.')) return;
+
+  btn.disabled = true; btn.textContent = 'Yuborilmoqda...';
+  try {
+    const res = await fetch('/api/public/delete-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, password })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      msg.textContent = 'Akkauntingiz muvaffaqiyatli o\\'chirildi.';
+      msg.className = 'ok';
+      document.getElementById('delForm').style.display = 'none';
+    } else {
+      msg.textContent = data.detail || 'Xatolik yuz berdi.';
+      msg.className = 'err';
+    }
+  } catch (err) {
+    msg.textContent = 'Server bilan aloqa yo\\'q. Birozdan so\\'ng qayta urinib ko\\'ring.';
+    msg.className = 'err';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Akkauntni butunlay o\\'chirish';
+  }
+});
+</script>
+</body>
+</html>"""
+
+
 
 # ============================================
 # USER ENDPOINTS
