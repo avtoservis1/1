@@ -850,7 +850,9 @@ class ForgotPasswordVerifyRequest(BaseModel):
 
 class ResetPasswordRequest(BaseModel):
     phone: str
-    code: str
+    # code bo'sh bo'lsa: telefon login ekranida allaqachon SMS bilan tasdiqlangan
+    # bo'lishi kerak (serverda tekshiriladi) - ikkinchi marta SMS so'ralmaydi.
+    code: Optional[str] = None
     new_password: str = Field(..., min_length=6)
 
     @validator('phone')
@@ -2431,10 +2433,20 @@ def forgot_password_reset(request: ResetPasswordRequest, db: Session = Depends(g
     """Parolni tiklash - 3-bosqich: kodni yana tekshirib, yangi parolni saqlaydi va
     foydalanuvchini o'sha akkauntga kiritadi (token qaytaradi)."""
     user = _get_resettable_user(db, request.phone)
-    otp = _check_reset_otp(db, request.phone, request.code)
+
+    if request.code:
+        # Eski yo'l: yangi SMS kod bilan tiklash.
+        otp = _check_reset_otp(db, request.phone, request.code)
+        otp.is_used = True
+    else:
+        # Yangi yo'l: login ekranida SMS allaqachon tasdiqlangan - qayta SMS yo'q.
+        # Server so'nggi 10 daqiqada shu raqam tasdiqlanganini tekshiradi.
+        if not _phone_recently_verified(db, request.phone, minutes=10):
+            raise HTTPException(
+                status_code=409,
+                detail="Tasdiqlash muddati tugagan. SMS kodni qayta tasdiqlang")
 
     user.password_hash = hash_password(request.new_password)
-    otp.is_used = True
     db.commit()
 
     token = generate_token(user.id)
