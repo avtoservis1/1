@@ -453,6 +453,7 @@ class OTPCode(Base):
     code = Column(String(6), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     is_used = Column(Boolean, default=False)
+    attempts = Column(Integer, default=0)  # parolni tiklashda noto'g'ri urinishlar soni
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 # Create tables
@@ -831,6 +832,29 @@ class LoginRequest(BaseModel):
         # raqamni biroz boshqacharoq formatda yuborsa (probel/tire farqi va h.k.),
         # baza bo'yicha aniq (==) qidiruv mos kelmay, "Telefon raqam yoki parol
         # noto'g'ri" xatosi chiqardi - garchi ma'lumotlar to'g'ri bo'lsa ham.
+        v = v.replace(' ', '').replace('-', '')
+        if not v.startswith('+'):
+            raise ValueError('Telefon raqam + bilan boshlanishi kerak')
+        return v
+
+class ForgotPasswordVerifyRequest(BaseModel):
+    phone: str
+    code: str
+
+    @validator('phone')
+    def validate_phone(cls, v):
+        v = v.replace(' ', '').replace('-', '')
+        if not v.startswith('+'):
+            raise ValueError('Telefon raqam + bilan boshlanishi kerak')
+        return v
+
+class ResetPasswordRequest(BaseModel):
+    phone: str
+    code: str
+    new_password: str = Field(..., min_length=6)
+
+    @validator('phone')
+    def validate_phone(cls, v):
         v = v.replace(' ', '').replace('-', '')
         if not v.startswith('+'):
             raise ValueError('Telefon raqam + bilan boshlanishi kerak')
@@ -2315,6 +2339,113 @@ def login_verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
         "name": user.name,
         "phone": user.phone,
         "role": user.role
+    }
+
+# ============================================
+# PAROLNI TIKLASH (parol esdan chiqqanda) - user va servis egasi uchun
+# ============================================
+# Oqim: 1) telefon -> SMS kod  2) kodni tekshirish  3) yangi parol -> akkauntga kirish.
+# Kod 3-bosqichda (reset) yana bir bor tekshiriladi va faqat shunda ishlatilgan
+# (is_used) deb belgilanadi - shuning uchun 2-bosqichni aylanib o'tib bo'lmaydi.
+RESET_MAX_ATTEMPTS = 5
+
+def _get_resettable_user(db: Session, phone: str) -> "User":
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Bu telefon raqam ro'yxatdan o'tmagan")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Akkaunt bloklangan")
+    # Admin va ochiq (hammaga ma'lum) test kodli raqamlar parolini SMS orqali
+    # tiklash mumkin emas - aks holda TEST_OTP_CODE bilan har kim ularni egallab olardi.
+    if user.role == UserRole.ADMIN.value or phone in TEST_PHONE_NUMBERS:
+        raise HTTPException(status_code=403, detail="Bu akkaunt parolini ilova orqali tiklab bo'lmaydi")
+    return user
+
+def _check_reset_otp(db: Session, phone: str, code: str) -> "OTPCode":
+    """Kod to'g'ri bo'lsa OTP yozuvini qaytaradi (ISTE'MOL QILMAYDI).
+    Noto'g'ri bo'lsa urinishlar sonini oshiradi; RESET_MAX_ATTEMPTS ga yetsa kodni bekor qiladi."""
+    now = datetime.datetime.utcnow()
+    active = db.query(OTPCode).filter(
+        OTPCode.phone == phone,
+        OTPCode.is_used == False,
+        OTPCode.expires_at > now,
+    ).order_by(OTPCode.created_at.desc()).all()
+
+    if not active:
+        raise HTTPException(status_code=400, detail="Kod eskirgan. Yangi kod so'rang")
+
+    for otp in active:
+        if otp.code == code:
+            return otp
+
+    latest = active[0]
+    latest.attempts = (latest.attempts or 0) + 1
+    locked = latest.attempts >= RESET_MAX_ATTEMPTS
+    if locked:
+        # is_used=True QILMAYMIZ (u "telefon tasdiqlangan" degan ma'noni beradi),
+        # faqat amal qilish muddatini tugatamiz.
+        latest.expires_at = now
+    db.commit()
+    if locked:
+        raise HTTPException(status_code=400, detail="Juda ko'p noto'g'ri urinish. Yangi kod so'rang")
+    raise HTTPException(status_code=400, detail="Noto'g'ri kod")
+
+@app.post("/api/forgot-password/send-otp")
+def forgot_password_send_otp(request: PhoneRequest, db: Session = Depends(get_db)):
+    """Parolni tiklash - 1-bosqich: ro'yxatdan o'tgan raqamga SMS kod yuborish."""
+    _get_resettable_user(db, request.phone)
+
+    # SMS bombing'dan himoya: 10 daqiqada 5 tadan ortiq kod yubormaymiz.
+    since = datetime.datetime.utcnow() - datetime.timedelta(minutes=10)
+    recent = db.query(OTPCode).filter(
+        OTPCode.phone == request.phone,
+        OTPCode.created_at >= since,
+    ).count()
+    if recent >= 5:
+        raise HTTPException(status_code=429, detail="Juda ko'p so'rov. Bir necha daqiqadan so'ng urinib ko'ring")
+
+    code = generate_otp()
+    expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=5)
+    db.add(OTPCode(phone=request.phone, code=code, expires_at=expires_at))
+    db.commit()
+
+    # Eskiz'da tasdiqlangan shablon bilan so'zma-so'z bir xil (yuqoridagi /api/send-otp kabi).
+    message = f"GoFix ilovasiga kirish uchun tasdiqlash kodi: {code}, 5 daqiqa amal qiladi."
+    if not send_sms(request.phone, message):
+        raise HTTPException(status_code=500, detail="SMS yuborishda xatolik yuz berdi. Birozdan so'ng qayta urinib ko'ring")
+
+    response = {"success": True, "message": "SMS yuborildi", "expires_in": 300}
+    if os.getenv("APP_ENV") != "production":
+        response["demo_code"] = code
+    return response
+
+@app.post("/api/forgot-password/verify-otp")
+def forgot_password_verify_otp(request: ForgotPasswordVerifyRequest, db: Session = Depends(get_db)):
+    """Parolni tiklash - 2-bosqich: SMS kodni tekshirish (kodni hali ISHLATMAYDI)."""
+    _get_resettable_user(db, request.phone)
+    _check_reset_otp(db, request.phone, request.code)
+    return {"success": True, "message": "Kod tasdiqlandi"}
+
+@app.post("/api/forgot-password/reset")
+def forgot_password_reset(request: ResetPasswordRequest, db: Session = Depends(get_db)):
+    """Parolni tiklash - 3-bosqich: kodni yana tekshirib, yangi parolni saqlaydi va
+    foydalanuvchini o'sha akkauntga kiritadi (token qaytaradi)."""
+    user = _get_resettable_user(db, request.phone)
+    otp = _check_reset_otp(db, request.phone, request.code)
+
+    user.password_hash = hash_password(request.new_password)
+    otp.is_used = True
+    db.commit()
+
+    token = generate_token(user.id)
+    return {
+        "success": True,
+        "message": "Parol yangilandi",
+        "token": token,
+        "user_id": user.id,
+        "name": user.name,
+        "phone": user.phone,
+        "role": user.role,
     }
 
 @app.post("/api/change-password")
