@@ -923,6 +923,31 @@ class ServiceOwnerRegisterRequest(BaseModel):
             raise ValueError('Telefon raqam + bilan boshlanishi kerak')
         return v
 
+class AdminCreateServiceOwnerRequest(BaseModel):
+    """Admin paneldan usta (servis egasi / evakuator / benzin dastavka) qo'shish.
+    Telefon OTP bilan tasdiqlanmaydi - ustaga login/parol SMS bilan yuboriladi."""
+    phone: str
+    first_name: str
+    last_name: str
+    password: str = Field(..., min_length=6)
+    provider_type: str = "auto_service"
+    service_name: Optional[str] = None
+    address: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    day_off: Optional[str] = None
+    working_hours: Optional[str] = None
+    logo_base64: Optional[str] = None
+    car_model: Optional[str] = None
+    service_type_ids: Optional[List[int]] = None
+
+    @validator('phone')
+    def validate_phone(cls, v):
+        v = v.replace(' ', '').replace('-', '')
+        if not v.startswith('+'):
+            raise ValueError('Telefon raqam + bilan boshlanishi kerak')
+        return v
+
 class ServiceEditRequest(BaseModel):
     name: Optional[str] = None
     owner_name: Optional[str] = None  # servis egasi/haydovchining to'liq ismi (Users.name)
@@ -1602,6 +1627,121 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
         "service_id": service.id,
         "status": service.status,
         "provider_type": service.provider_type,
+    }
+
+# DIQQAT: bu matn Eskiz.uz'da (jo'natuvchi "4546") tasdiqlangan shablon bilan
+# so'zma-so'z bir xil bo'lishi shart - aks holda operator SMS'ni rad etadi.
+# Matnni o'zgartirmoqchi bo'lsangiz, avval Eskiz kabinetida yangi shablonni
+# tasdiqlatib oling.
+ADMIN_CREATED_OWNER_SMS = (
+    "Siz admin tomonidan GoFix usta ilovasidan ro'yxatdan o'tkazildingiz. "
+    "Ilovani Play Market yoki App Store orqali o'rnating. "
+    "Tel: {phone}, parol: {password}"
+)
+
+@app.post("/api/admin/service-owners")
+def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Session = Depends(get_db)):
+    """Admin ustani o'zi ro'yxatdan o'tkazadi (telefon OTP so'ralmaydi).
+    Akkaunt va servis darhol 'approved' holatida yaratiladi, ustaning raqamiga
+    login (telefon) va parol SMS orqali yuboriladi. Usta ilovaga kirganda esa
+    odatdagidek SMS OTP (telefon tasdiqlash) ishlaydi."""
+
+    if request.provider_type not in ("auto_service", "evacuator", "fuel"):
+        raise HTTPException(status_code=400, detail="Noto'g'ri provider_type")
+
+    first_name = request.first_name.strip()
+    last_name = request.last_name.strip()
+    if not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="Ism va familiya kiritilishi shart")
+
+    if request.provider_type == "auto_service":
+        if not request.service_name or not request.service_name.strip() or not request.address \
+                or request.latitude is None or request.longitude is None:
+            raise HTTPException(status_code=400, detail="Servis nomi, manzil va joylashuv kiritilishi shart")
+    else:
+        if not request.car_model or not request.car_model.strip():
+            raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
+
+    # Mavjud akkauntni (ayniqsa admin yoki oddiy foydalanuvchini) ustiga yozib
+    # yubormaymiz - raqam band bo'lsa, xato qaytaramiz.
+    if db.query(User).filter(User.phone == request.phone).first():
+        raise HTTPException(status_code=400, detail="Bu telefon raqam allaqachon ro'yxatdan o'tgan")
+
+    full_name = f"{first_name} {last_name}".strip()
+    display_name = request.service_name.strip() if request.service_name and request.service_name.strip() else full_name
+
+    try:
+        user = User(
+            phone=request.phone,
+            name=full_name,
+            password_hash=hash_password(request.password),
+            role=UserRole.SERVICE_OWNER.value,
+            is_active=True,
+        )
+        db.add(user)
+        db.flush()  # user.id kerak
+
+        service = Service(
+            owner_id=user.id,
+            name=display_name,
+            phone=request.phone,
+            address=request.address,
+            latitude=request.latitude,
+            longitude=request.longitude,
+            day_off=request.day_off,
+            working_hours=request.working_hours,
+            logo_url=request.logo_base64,
+            car_model=request.car_model,
+            provider_type=request.provider_type,
+            # Admin o'zi qo'shgani uchun tasdiq kutilmaydi.
+            is_active=True,
+            is_verified=True,
+            status="approved",
+        )
+        db.add(service)
+        db.flush()  # service.id kerak
+
+        if request.provider_type == "auto_service" and request.service_type_ids:
+            stypes = db.query(ServiceType).filter(
+                ServiceType.id.in_(set(request.service_type_ids)), ServiceType.is_active == True
+            ).all()
+            for stype in stypes:
+                db.add(ServiceOffered(
+                    service_id=service.id,
+                    service_type_id=stype.id,
+                    category=stype.name,
+                    price=stype.price,
+                    is_active=True,
+                    status="approved",
+                    added_by_admin=True,
+                ))
+
+        db.commit()
+        db.refresh(user)
+        db.refresh(service)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logging.getLogger("uvicorn.error").error(f"[admin-create-owner] xatolik: {e}")
+        raise HTTPException(status_code=500, detail="Ustani qo'shishda xatolik yuz berdi")
+
+    # Login ma'lumotlarini SMS bilan yuboramiz. SMS ketmasa ham akkaunt yaratilgan
+    # bo'lib qoladi - admin ilovasi buni ko'rsatadi va ma'lumotni qo'lda yetkazadi.
+    sms_sent = send_sms(
+        user.phone,
+        ADMIN_CREATED_OWNER_SMS.format(phone=user.phone, password=request.password),
+    )
+
+    return {
+        "success": True,
+        "message": "Usta qo'shildi" if sms_sent else "Usta qo'shildi, lekin SMS yuborilmadi",
+        "user_id": user.id,
+        "service_id": service.id,
+        "status": service.status,
+        "provider_type": service.provider_type,
+        "sms_sent": sms_sent,
     }
 
 @app.get("/api/service-owner/status")
