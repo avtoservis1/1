@@ -229,6 +229,23 @@ class Service(Base):
     reviews = relationship("Review", back_populates="service")
     favorites = relationship("Favorite", back_populates="service")
 
+class ServiceStaff(Base):
+    """Umumiy servisda ishlaydigan usta. Servisni FAQAT admin yaratadi; ustalar
+    ro'yxatdan o'tishda tayyor servislardan birini tanlaydi (yoki admin ustani
+    o'zi biriktiradi). Bitta servisda istalgancha usta ishlashi mumkin.
+    status: pending (admin tasdig'i kutilmoqda) | approved | rejected."""
+    __tablename__ = "service_staff"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_id = Column(Integer, ForeignKey("services.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    status = Column(String(20), default="pending")
+    reject_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    service = relationship("Service")
+    user = relationship("User")
+
 class ServiceType(Base):
     """
     Admin tomonidan boshqariladigan umumiy xizmat turlari katalogi (masalan
@@ -915,6 +932,8 @@ class ServiceOwnerRegisterRequest(BaseModel):
     # yaratilgan zahoti 'approved' ServiceOffered yozuvlariga aylanadi va
     # mijozlarga servis profilida darhol ko'rinadi.
     service_type_ids: Optional[List[int]] = None
+    # auto_service uchun: usta ishlaydigan, admin yaratgan servisning ID'si.
+    service_id: Optional[int] = None
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -924,13 +943,16 @@ class ServiceOwnerRegisterRequest(BaseModel):
         return v
 
 class AdminCreateServiceOwnerRequest(BaseModel):
-    """Admin paneldan usta (servis egasi / evakuator / benzin dastavka) qo'shish.
-    Telefon OTP bilan tasdiqlanmaydi - ustaga login/parol SMS bilan yuboriladi."""
+    """Admin paneldan usta qo'shish. Telefon OTP bilan tasdiqlanmaydi - ustaga
+    login/parol SMS bilan yuboriladi.
+    auto_service: usta admin yaratgan tayyor servisga (service_id) biriktiriladi.
+    evacuator / fuel: usta o'zining mashinasi bilan alohida provayder bo'ladi."""
     phone: str
     first_name: str
     last_name: str
     password: str = Field(..., min_length=6)
     provider_type: str = "auto_service"
+    service_id: Optional[int] = None
     service_name: Optional[str] = None
     address: Optional[str] = None
     latitude: Optional[float] = None
@@ -939,7 +961,6 @@ class AdminCreateServiceOwnerRequest(BaseModel):
     working_hours: Optional[str] = None
     logo_base64: Optional[str] = None
     car_model: Optional[str] = None
-    service_type_ids: Optional[List[int]] = None
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -947,6 +968,19 @@ class AdminCreateServiceOwnerRequest(BaseModel):
         if not v.startswith('+'):
             raise ValueError('Telefon raqam + bilan boshlanishi kerak')
         return v
+
+class AdminServiceCreateRequest(BaseModel):
+    """Admin yangi (umumiy) avtoservis yaratadi: ustalar keyin shu servislardan birini tanlaydi."""
+    name: str
+    phone: Optional[str] = None
+    address: str
+    latitude: float
+    longitude: float
+    day_off: Optional[str] = None
+    working_hours: Optional[str] = None
+    logo_base64: Optional[str] = None
+    description: Optional[str] = None
+    service_type_ids: Optional[List[int]] = None
 
 class ServiceEditRequest(BaseModel):
     name: Optional[str] = None
@@ -1513,6 +1547,64 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
         "role": user.role
     }
 
+# ============================================
+# UMUMIY SERVIS + USTALAR (ServiceStaff)
+# ============================================
+def get_staff_membership(db: Session, user_id: int):
+    return db.query(ServiceStaff).filter(ServiceStaff.user_id == user_id).order_by(ServiceStaff.id.desc()).first()
+
+def get_service_for_owner(db: Session, owner_id: int):
+    """Ustaning servisi: avval u tanlagan/biriktirilgan umumiy servis (ServiceStaff),
+    bo'lmasa o'zi egalik qiladigan servis (evakuator, benzin dastavka va eski
+    avtoservislar)."""
+    membership = get_staff_membership(db, owner_id)
+    if membership is not None:
+        return membership.service
+    return db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+
+def staff_overrides(db: Session, owner_id: int, service):
+    """Umumiy servisda ishlaydigan ustaning ariza holati servisniki emas,
+    ustaning o'ziniki (ServiceStaff) bo'ladi."""
+    membership = get_staff_membership(db, owner_id)
+    if membership is None or membership.service_id != service.id:
+        return {}
+    return {
+        "status": membership.status,
+        "reject_reason": membership.reject_reason,
+        "is_verified": membership.status == "approved",
+        "is_active": bool(service.is_active) and membership.status == "approved",
+    }
+
+def service_recipient_ids(db: Session, service):
+    """Servisga kelgan buyurtma/xabar bildirishnomasi kimlarga boradi:
+    servisning barcha tasdiqlangan ustalariga (va servis egasi usta bo'lsa, unga)."""
+    ids = [r[0] for r in db.query(ServiceStaff.user_id).filter(
+        ServiceStaff.service_id == service.id, ServiceStaff.status == "approved").all()]
+    owner = service.owner
+    if owner is not None and owner.role == UserRole.SERVICE_OWNER.value and owner.id not in ids:
+        ids.append(owner.id)
+    # Hech kim bo'lmasa (servisda hali usta yo'q) - servis egasiga (admin) boradi.
+    return ids or [service.owner_id]
+
+def get_registrable_service(db: Session, service_id: int):
+    """Usta ishlash uchun tanlashi mumkin bo'lgan servis (admin yaratgan, tasdiqlangan avtoservis)."""
+    service = db.query(Service).filter(
+        Service.id == service_id,
+        Service.provider_type == "auto_service",
+        Service.status == "approved",
+        Service.is_active == True,
+    ).first()
+    if not service:
+        raise HTTPException(status_code=400, detail="Tanlangan servis topilmadi")
+    return service
+
+def admin_owner_id(db: Session) -> int:
+    """Admin yaratgan servislarning egasi (Service.owner_id NOT NULL) - birinchi admin akkaunti."""
+    admin = db.query(User).filter(User.role == UserRole.ADMIN.value).order_by(User.id).first()
+    if not admin:
+        raise HTTPException(status_code=500, detail="Admin akkaunti topilmadi")
+    return admin.id
+
 @app.post("/api/service-owner/register")
 def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = Depends(get_db)):
     """Servis egasini / evakuator / benzin dastavka provayderini ro'yxatdan o'tkazish
@@ -1522,9 +1614,12 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
     if request.provider_type not in ("auto_service", "evacuator", "fuel"):
         raise HTTPException(status_code=400, detail="Noto'g'ri provider_type")
 
+    shared_service = None
     if request.provider_type == "auto_service":
-        if not request.service_name or not request.address or request.latitude is None or request.longitude is None:
-            raise HTTPException(status_code=400, detail="Servis nomi va manzil kiritilishi shart")
+        # Avtoservisni FAQAT admin yaratadi - usta tayyor servislardan birini tanlaydi.
+        if request.service_id is None:
+            raise HTTPException(status_code=400, detail="Ishlaydigan servisni tanlang")
+        shared_service = get_registrable_service(db, request.service_id)
     else:
         if not request.car_model:
             raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
@@ -1557,6 +1652,39 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
         user.role = UserRole.SERVICE_OWNER.value
         user.password_hash = hash_password(request.password)
         db.commit()
+
+    if request.provider_type == "auto_service":
+        # Yangi servis YARATILMAYDI: usta tanlangan servisga 'pending' holatida
+        # biriktiriladi va admin tasdig'ini kutadi.
+        membership = get_staff_membership(db, user.id)
+        if membership is None:
+            membership = ServiceStaff(service_id=shared_service.id, user_id=user.id, status="pending")
+            db.add(membership)
+        else:
+            membership.service_id = shared_service.id
+            membership.status = "pending"
+            membership.reject_reason = None
+        db.commit()
+        db.refresh(membership)
+
+        for admin_user in db.query(User).filter(User.role == UserRole.ADMIN.value).all():
+            create_notification(
+                db, admin_user.id,
+                "Yangi usta arizasi",
+                f"{full_name} {shared_service.name} servisida ishlash uchun ariza berdi.",
+                type="new_staff_application", related_id=membership.id,
+            )
+
+        return {
+            "success": True,
+            "message": "Arizangiz qabul qilindi. Admin tasdiqlashini kuting.",
+            "token": generate_token(user.id),
+            "user_id": user.id,
+            "service_id": shared_service.id,
+            "service_name": shared_service.name,
+            "status": membership.status,
+            "provider_type": "auto_service",
+        }
 
     # Evakuator/fuel uchun alohida "servis nomi" kiritilmaydi - haydovchi ismi
     # to'liq nomi sifatida ishlatiladi (masalan mijozga "Evakuator - Bobur Aliyev" kabi ko'rsatish uchun).
@@ -1642,9 +1770,10 @@ ADMIN_CREATED_OWNER_SMS = (
 @app.post("/api/admin/service-owners")
 def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Session = Depends(get_db)):
     """Admin ustani o'zi ro'yxatdan o'tkazadi (telefon OTP so'ralmaydi).
-    Akkaunt va servis darhol 'approved' holatida yaratiladi, ustaning raqamiga
-    login (telefon) va parol SMS orqali yuboriladi. Usta ilovaga kirganda esa
-    odatdagidek SMS OTP (telefon tasdiqlash) ishlaydi."""
+    Avtoservis ustasi tanlangan tayyor servisga darhol 'approved' holatida
+    biriktiriladi; evakuator/benzin dastavka esa o'z mashinasi bilan alohida
+    provayder bo'ladi. Ustaning raqamiga login (telefon) va parol SMS orqali
+    yuboriladi; usta ilovaga kirganda esa odatdagidek SMS OTP ishlaydi."""
 
     if request.provider_type not in ("auto_service", "evacuator", "fuel"):
         raise HTTPException(status_code=400, detail="Noto'g'ri provider_type")
@@ -1654,13 +1783,13 @@ def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Sess
     if not first_name or not last_name:
         raise HTTPException(status_code=400, detail="Ism va familiya kiritilishi shart")
 
+    shared_service = None
     if request.provider_type == "auto_service":
-        if not request.service_name or not request.service_name.strip() or not request.address \
-                or request.latitude is None or request.longitude is None:
-            raise HTTPException(status_code=400, detail="Servis nomi, manzil va joylashuv kiritilishi shart")
-    else:
-        if not request.car_model or not request.car_model.strip():
-            raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
+        if request.service_id is None:
+            raise HTTPException(status_code=400, detail="Ustani biriktirish uchun servisni tanlang")
+        shared_service = get_registrable_service(db, request.service_id)
+    elif not request.car_model or not request.car_model.strip():
+        raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
 
     # Mavjud akkauntni (ayniqsa admin yoki oddiy foydalanuvchini) ustiga yozib
     # yubormaymiz - raqam band bo'lsa, xato qaytaramiz.
@@ -1668,7 +1797,6 @@ def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Sess
         raise HTTPException(status_code=400, detail="Bu telefon raqam allaqachon ro'yxatdan o'tgan")
 
     full_name = f"{first_name} {last_name}".strip()
-    display_name = request.service_name.strip() if request.service_name and request.service_name.strip() else full_name
 
     try:
         user = User(
@@ -1681,41 +1809,28 @@ def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Sess
         db.add(user)
         db.flush()  # user.id kerak
 
-        service = Service(
-            owner_id=user.id,
-            name=display_name,
-            phone=request.phone,
-            address=request.address,
-            latitude=request.latitude,
-            longitude=request.longitude,
-            day_off=request.day_off,
-            working_hours=request.working_hours,
-            logo_url=request.logo_base64,
-            car_model=request.car_model,
-            provider_type=request.provider_type,
-            # Admin o'zi qo'shgani uchun tasdiq kutilmaydi.
-            is_active=True,
-            is_verified=True,
-            status="approved",
-        )
-        db.add(service)
-        db.flush()  # service.id kerak
-
-        if request.provider_type == "auto_service" and request.service_type_ids:
-            stypes = db.query(ServiceType).filter(
-                ServiceType.id.in_(set(request.service_type_ids)), ServiceType.is_active == True
-            ).all()
-            for stype in stypes:
-                db.add(ServiceOffered(
-                    service_id=service.id,
-                    service_type_id=stype.id,
-                    category=stype.name,
-                    price=stype.price,
-                    is_active=True,
-                    status="approved",
-                    added_by_admin=True,
-                ))
-
+        if shared_service is not None:
+            service = shared_service
+            db.add(ServiceStaff(service_id=service.id, user_id=user.id, status="approved"))
+        else:
+            service = Service(
+                owner_id=user.id,
+                name=request.service_name.strip() if request.service_name and request.service_name.strip() else full_name,
+                phone=request.phone,
+                address=request.address,
+                latitude=request.latitude,
+                longitude=request.longitude,
+                day_off=request.day_off,
+                working_hours=request.working_hours,
+                logo_url=request.logo_base64,
+                car_model=request.car_model,
+                provider_type=request.provider_type,
+                # Admin o'zi qo'shgani uchun tasdiq kutilmaydi.
+                is_active=True,
+                is_verified=True,
+                status="approved",
+            )
+            db.add(service)
         db.commit()
         db.refresh(user)
         db.refresh(service)
@@ -1739,24 +1854,161 @@ def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Sess
         "message": "Usta qo'shildi" if sms_sent else "Usta qo'shildi, lekin SMS yuborilmadi",
         "user_id": user.id,
         "service_id": service.id,
-        "status": service.status,
+        "service_name": service.name,
+        "status": "approved",
         "provider_type": service.provider_type,
         "sms_sent": sms_sent,
     }
 
+@app.post("/api/admin/services")
+def admin_create_service(request: AdminServiceCreateRequest, db: Session = Depends(get_db)):
+    """Admin yangi avtoservis yaratadi (nomi, manzili, xaritadagi joylashuvi, logotipi...).
+    Servis darhol tasdiqlangan holatda chiqadi. Ustalar ro'yxatdan o'tishda shu
+    servislardan birini tanlaydi; bitta servisda istalgancha usta ishlashi mumkin."""
+    name = request.name.strip()
+    address = request.address.strip()
+    if not name or not address:
+        raise HTTPException(status_code=400, detail="Servis nomi va manzil kiritilishi shart")
+
+    service = Service(
+        owner_id=admin_owner_id(db),
+        name=name,
+        description=request.description,
+        phone=(request.phone or "").strip(),
+        address=address,
+        latitude=request.latitude,
+        longitude=request.longitude,
+        day_off=request.day_off,
+        working_hours=request.working_hours,
+        logo_url=request.logo_base64,
+        provider_type="auto_service",
+        is_active=True,
+        is_verified=True,
+        status="approved",
+    )
+    db.add(service)
+    db.flush()
+
+    if request.service_type_ids:
+        stypes = db.query(ServiceType).filter(
+            ServiceType.id.in_(set(request.service_type_ids)), ServiceType.is_active == True
+        ).all()
+        for stype in stypes:
+            db.add(ServiceOffered(
+                service_id=service.id,
+                service_type_id=stype.id,
+                category=stype.name,
+                price=stype.price,
+                is_active=True,
+                status="approved",
+                added_by_admin=True,
+            ))
+    db.commit()
+    db.refresh(service)
+    return {"success": True, "id": service.id, "name": service.name, "message": "Servis qo'shildi"}
+
+@app.get("/api/service-owner/available-services")
+def available_services_for_registration(db: Session = Depends(get_db)):
+    """Usta ro'yxatdan o'tayotganda ishlash uchun tanlaydigan servislar ro'yxati
+    (admin yaratgan, tasdiqlangan avtoservislar). Logotip yuborilmaydi (juda katta)."""
+    services = db.query(Service).filter(
+        Service.provider_type == "auto_service",
+        Service.status == "approved",
+        Service.is_active == True,
+    ).order_by(Service.name).all()
+    staff_counts = dict(
+        db.query(ServiceStaff.service_id, func.count(ServiceStaff.id))
+        .filter(ServiceStaff.status == "approved")
+        .group_by(ServiceStaff.service_id).all()
+    )
+    return [
+        {
+            "id": s.id,
+            "name": s.name,
+            "address": display_service_address(s),
+            "latitude": s.latitude,
+            "longitude": s.longitude,
+            "working_hours": s.working_hours,
+            "day_off": s.day_off,
+            "rating": s.rating,
+            "staff_count": staff_counts.get(s.id, 0),
+        }
+        for s in services
+    ]
+
+# ---- Admin: ustalar (servisga biriktirilgan) ----
+def _staff_to_dict(m):
+    return {
+        "id": m.id,
+        "user_id": m.user_id,
+        "name": m.user.name if m.user else "",
+        "phone": m.user.phone if m.user else "",
+        "service_id": m.service_id,
+        "service_name": m.service.name if m.service else "",
+        "service_address": display_service_address(m.service) if m.service else "",
+        "status": m.status,
+        "reject_reason": m.reject_reason,
+        "created_at": m.created_at,
+    }
+
+@app.get("/api/admin/staff")
+def admin_list_staff(status: Optional[str] = None, service_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Servislarga biriktirilgan ustalar: status = pending | approved | rejected | (hammasi)."""
+    query = db.query(ServiceStaff)
+    if status:
+        query = query.filter(ServiceStaff.status == status)
+    if service_id:
+        query = query.filter(ServiceStaff.service_id == service_id)
+    return [_staff_to_dict(m) for m in query.order_by(ServiceStaff.id.desc()).all()]
+
+@app.put("/api/admin/staff/{staff_id}/approve")
+def admin_approve_staff(staff_id: int, db: Session = Depends(get_db)):
+    m = db.query(ServiceStaff).filter(ServiceStaff.id == staff_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Usta arizasi topilmadi")
+    m.status = "approved"
+    m.reject_reason = None
+    db.commit()
+    return {"id": m.id, "status": m.status}
+
+@app.put("/api/admin/staff/{staff_id}/reject")
+def admin_reject_staff(staff_id: int, request: ServiceRejectRequest, db: Session = Depends(get_db)):
+    m = db.query(ServiceStaff).filter(ServiceStaff.id == staff_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Usta arizasi topilmadi")
+    m.status = "rejected"
+    m.reject_reason = request.reason
+    db.commit()
+    return {"id": m.id, "status": m.status, "reject_reason": m.reject_reason}
+
+@app.delete("/api/admin/staff/{staff_id}")
+def admin_remove_staff(staff_id: int, db: Session = Depends(get_db)):
+    """Ustani servisdan chiqarish (akkaunti o'chmaydi, faqat servisga biriktirilishi bekor bo'ladi)."""
+    m = db.query(ServiceStaff).filter(ServiceStaff.id == staff_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Usta topilmadi")
+    db.delete(m)
+    db.commit()
+    return {"success": True}
+
 @app.get("/api/service-owner/status")
-def service_owner_status(service_id: int, db: Session = Depends(get_db)):
-    """Servis egasi o'z arizasi holatini tekshirishi uchun (pending/approved/rejected)."""
+def service_owner_status(service_id: int, owner_id: Optional[int] = None, db: Session = Depends(get_db)):
+    """Servis egasi o'z arizasi holatini tekshirishi uchun (pending/approved/rejected).
+    owner_id berilsa va u umumiy servisda ishlaydigan usta bo'lsa - ustaning o'z
+    ariza holati qaytariladi."""
     service = db.query(Service).filter(Service.id == service_id).first()
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
-    return {
+    result = {
         "id": service.id,
         "status": service.status,
         "is_verified": service.is_verified,
         "is_active": service.is_active,
         "reject_reason": service.reject_reason,
     }
+    if owner_id is not None:
+        result.update(staff_overrides(db, owner_id, service))
+    return result
 
 @app.get("/api/service-owner/service")
 def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
@@ -1770,11 +2022,11 @@ def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
     if owner.role != UserRole.SERVICE_OWNER.value:
         raise HTTPException(status_code=403, detail="Bu foydalanuvchi servis egasi emas")
 
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
-    return {
+    payload = {
         "id": service.id,
         "name": service.name,
         "status": service.status,
@@ -1797,11 +2049,13 @@ def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
         "current_latitude": service.current_latitude,
         "current_longitude": service.current_longitude,
     }
+    payload.update(staff_overrides(db, owner_id, service))
+    return payload
 
 @app.get("/api/service-owner/orders")
 def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
     """Servis egasining o'z serviciga tushgan buyurtmalari ro'yxati (dashboard uchun)."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         return []
 
@@ -1861,18 +2115,22 @@ def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpda
     if not owner or owner.role != UserRole.SERVICE_OWNER.value:
         raise HTTPException(status_code=403, detail="Bu foydalanuvchi servis egasi emas")
 
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
-    data = request.dict(exclude_unset=True)
-    logo_base64 = data.pop("logo_base64", None)
-    for field, value in data.items():
-        setattr(service, field, value)
-    if logo_base64:
-        service.logo_url = logo_base64
-    if request.name:
-        owner.name = request.name
+    # Admin yaratgan umumiy servisning ma'lumotlarini (nomi, manzil, logotip...)
+    # faqat admin o'zgartiradi - usta ularni tahrirlay olmaydi.
+    shared = service.owner_id != owner_id
+    if not shared:
+        data = request.dict(exclude_unset=True)
+        logo_base64 = data.pop("logo_base64", None)
+        for field, value in data.items():
+            setattr(service, field, value)
+        if logo_base64:
+            service.logo_url = logo_base64
+        if request.name:
+            owner.name = request.name
     db.commit()
     db.refresh(service)
 
@@ -1897,7 +2155,7 @@ def list_services_offered(owner_id: int, db: Session = Depends(get_db)):
     Bu yerda pending/rejected xizmatlar ham ko'rsatiladi - servis egasi ularning
     holatini ko'rib turishi uchun. Foydalanuvchilarga esa faqat 'approved' bo'lganlari
     chiqadi (bunga /api/services va /api/services/{id} javob beradi)."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         return []
     items = db.query(ServiceOffered).filter(ServiceOffered.service_id == service.id).order_by(ServiceOffered.id.desc()).all()
@@ -1920,7 +2178,7 @@ def upsert_service_offered(owner_id: int, request: ServiceOfferedUpsert, db: Ses
     """Yangi xizmat qo'shadi (har doim 'pending' holatda - admin tasdiqlashi kerak),
     yoki mavjud bo'lsa (bir xil nom) narxi/faol-nofaol holatini yangilaydi (bu holat
     o'zgarishi qayta tasdiqlashni talab qilmaydi)."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
@@ -2000,7 +2258,7 @@ def get_service_type_image(type_id: int, db: Session = Depends(get_db)):
 def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
     """Servis egasi uchun: admin katalogidagi barcha faol xizmat turlari,
     har biri uchun shu servisda yoqilgan/yoqilmaganligi bilan birga."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     selected = {}
     if service:
         offered = db.query(ServiceOffered).filter(
@@ -2029,7 +2287,7 @@ def toggle_service_type(owner_id: int, request: ServiceOwnerTypeToggle, db: Sess
     (yoki o'chiradi). Nomi va narxi katalogdan (ServiceType) ko'chiriladi - servis
     egasi ularni o'zgartira olmaydi. Katalogdan tanlangani uchun darhol 'approved'
     holatda saqlanadi - qo'shimcha admin tasdiqlash shart emas."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
@@ -2242,7 +2500,7 @@ def admin_add_offered_service(service_id: int, request: AdminAddOfferedServiceRe
 @app.get("/api/service-owner/dashboard")
 def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
     """Dashboard: bugungi/faol/yakunlangan buyurtmalar va daromad statistikasi."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
@@ -2290,7 +2548,7 @@ def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
 @app.get("/api/service-owner/stats")
 def service_owner_stats(owner_id: int, period: str = "daily", db: Session = Depends(get_db)):
     """Kunlik/haftalik/oylik buyurtmalar soni va daromad ('Statistika' bo'limi)."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
@@ -2336,7 +2594,7 @@ def service_owner_stats(owner_id: int, period: str = "daily", db: Session = Depe
 @app.get("/api/service-owner/reviews")
 def service_owner_reviews(owner_id: int, db: Session = Depends(get_db)):
     """Servisga yozilgan fikr va baholar ro'yxati ('Reyting' bo'limi)."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         return {"rating": 0, "review_count": 0, "reviews": []}
 
@@ -2657,6 +2915,7 @@ def _perform_account_deletion(user: "User", db: Session):
     db.query(Favorite).filter(Favorite.user_id == user.id).delete(synchronize_session=False)
     db.query(Car).filter(Car.user_id == user.id).delete(synchronize_session=False)
     db.query(Notification).filter(Notification.user_id == user.id).delete(synchronize_session=False)
+    db.query(ServiceStaff).filter(ServiceStaff.user_id == user.id).delete(synchronize_session=False)
 
     # 6) Endi buyurtmalarning o'zini o'chirish mumkin (chat/sharh allaqachon tozalandi).
     if order_ids:
@@ -3174,12 +3433,13 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     if order_type == "scheduled" and scheduled_at:
         notif_text = f"{user.name} sizga bron qildi ({scheduled_at.strftime('%d.%m.%Y %H:%M')}): {service.name}"
 
-    create_notification(
-        db, service.owner_id,
-        "Yangi buyurtma",
-        notif_text,
-        type="new_order", related_id=new_order.id,
-    )
+    for recipient in service_recipient_ids(db, service):
+        create_notification(
+            db, recipient,
+            "Yangi buyurtma",
+            notif_text,
+            type="new_order", related_id=new_order.id,
+        )
 
     return {
         "id": new_order.id,
@@ -3318,14 +3578,18 @@ def send_message(sender_id: int, msg: ChatMessageCreate, db: Session = Depends(g
     db.refresh(chat_msg)
 
     # Xabar qarama-qarshi tomonga (mijoz <-> servis egasi) yuboriladi
-    recipient_id = order.service.owner_id if sender_id == order.user_id else order.user_id
+    if sender_id == order.user_id:
+        recipient_ids = service_recipient_ids(db, order.service)
+    else:
+        recipient_ids = [order.user_id]
     sender = db.query(User).filter(User.id == sender_id).first()
-    create_notification(
-        db, recipient_id,
-        f"Yangi xabar: {sender.name if sender else ''}",
-        msg.message[:150],
-        type="chat", related_id=msg.order_id,
-    )
+    for recipient_id in recipient_ids:
+        create_notification(
+            db, recipient_id,
+            f"Yangi xabar: {sender.name if sender else ''}",
+            msg.message[:150],
+            type="chat", related_id=msg.order_id,
+        )
 
     return chat_msg
 
@@ -3430,7 +3694,7 @@ def admin_get_users(db: Session = Depends(get_db)):
     for u in users:
         provider_type = None
         if u.role == UserRole.SERVICE_OWNER.value:
-            own_service = db.query(Service).filter(Service.owner_id == u.id).first()
+            own_service = get_service_for_owner(db, u.id)
             if own_service:
                 provider_type = own_service.provider_type
         result.append({
@@ -3454,7 +3718,7 @@ def admin_get_user_detail(user_id: int, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
 
-    own_service = db.query(Service).filter(Service.owner_id == user.id).first()
+    own_service = get_service_for_owner(db, user.id)
 
     return {
         "id": user.id,
@@ -3623,11 +3887,17 @@ def admin_get_services(status: Optional[str] = None, provider_type: Optional[str
     if provider_type:
         query = query.filter(Service.provider_type == provider_type)
     services = query.order_by(Service.created_at.desc()).all()
+    staff_counts = dict(
+        db.query(ServiceStaff.service_id, func.count(ServiceStaff.id))
+        .filter(ServiceStaff.status == "approved")
+        .group_by(ServiceStaff.service_id).all()
+    )
     return [
         {
             "id": s.id,
             "name": s.name,
             "owner_id": s.owner_id,
+            "staff_count": staff_counts.get(s.id, 0),
             "owner_name": s.owner.name,
             "phone": s.phone,
             "address": display_service_address(s),
@@ -3705,7 +3975,7 @@ def admin_edit_service(service_id: int, request: ServiceEditRequest, db: Session
         service.price = request.price
     if request.logo_base64 is not None:
         service.logo_url = request.logo_base64
-    if request.owner_name is not None and service.owner is not None:
+    if request.owner_name is not None and service.owner is not None and service.owner.role != UserRole.ADMIN.value:
         service.owner.name = request.owner_name
 
     db.commit()
@@ -3716,7 +3986,7 @@ def admin_edit_service(service_id: int, request: ServiceEditRequest, db: Session
 def service_owner_go_online(owner_id: int, request: LocationUpdateRequest, db: Session = Depends(get_db)):
     """Evakuator/benzin dastavka ish boshlaydi: joriy joylashuvini yuborib,
     xaritada ko'rinadigan (is_online=True) holatga o'tadi."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
     if service.provider_type not in ("evacuator", "fuel"):
@@ -3730,7 +4000,7 @@ def service_owner_go_online(owner_id: int, request: LocationUpdateRequest, db: S
 @app.put("/api/service-owner/go-offline")
 def service_owner_go_offline(owner_id: int, db: Session = Depends(get_db)):
     """Evakuator/benzin dastavka ish tugatadi: xaritadan yashiriladi (is_online=False)."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
     service.is_online = False
@@ -3740,7 +4010,7 @@ def service_owner_go_offline(owner_id: int, db: Session = Depends(get_db)):
 @app.put("/api/service-owner/location")
 def service_owner_update_location(owner_id: int, request: LocationUpdateRequest, db: Session = Depends(get_db)):
     """Ish vaqti davomida joriy joylashuvni davriy yangilab turish uchun."""
-    service = db.query(Service).filter(Service.owner_id == owner_id).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
     update_service_current_location(service, request.latitude, request.longitude)
@@ -3773,6 +4043,7 @@ def admin_delete_service(service_id: int, db: Session = Depends(get_db)):
     db.query(ServiceOffered).filter(ServiceOffered.service_id == service_id).delete(synchronize_session=False)
     db.query(Review).filter(Review.service_id == service_id).delete(synchronize_session=False)
     db.query(Favorite).filter(Favorite.service_id == service_id).delete(synchronize_session=False)
+    db.query(ServiceStaff).filter(ServiceStaff.service_id == service_id).delete(synchronize_session=False)
 
     db.delete(service)
     db.commit()
@@ -3987,7 +4258,7 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
     owner = db.query(User).filter(User.id == owner_id).first()
     if not owner:
         raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
-    service = db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
+    service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
     return {
@@ -4005,7 +4276,7 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
             "logo_url": service.logo_url,
             "rating": service.rating,
             "review_count": service.review_count,
-            "status": service.status,
+            "status": staff_overrides(db, owner_id, service).get("status", service.status),
             "is_active": service.is_active,
             "provider_type": service.provider_type,
             "car_model": service.car_model,
