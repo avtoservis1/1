@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Float, Text, ForeignKey, Enum as SQLEnum
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Float, Text, ForeignKey, Enum as SQLEnum, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
@@ -155,7 +155,7 @@ class User(Base):
 
     # Relationships
     cars = relationship("Car", back_populates="owner", cascade="all, delete-orphan")
-    orders = relationship("Order", back_populates="user", cascade="all, delete-orphan")
+    orders = relationship("Order", back_populates="user", cascade="all, delete-orphan", foreign_keys="Order.user_id")
     favorites = relationship("Favorite", back_populates="user", cascade="all, delete-orphan")
     reviews = relationship("Review", back_populates="user", cascade="all, delete-orphan")
 
@@ -396,8 +396,12 @@ class Order(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Mijoz buyurtmani servisdagi aynan qaysi ustaga bergani (avtoservis uchun).
+    # NULL bo'lsa - usta tanlanmagan (eski ilova/usul): servisning barcha ustalari ko'radi.
+    master_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 
-    user = relationship("User", back_populates="orders")
+    user = relationship("User", back_populates="orders", foreign_keys=[user_id])
+    master = relationship("User", foreign_keys=[master_id])
     service = relationship("Service", back_populates="orders")
     chat_messages = relationship("ChatMessage", back_populates="order", cascade="all, delete-orphan")
     review = relationship("Review", back_populates="order", uselist=False)
@@ -1096,6 +1100,8 @@ class ServiceResponse(BaseModel):
 
 class OrderCreate(BaseModel):
     service_id: int
+    # Avtoservis: mijoz tanlagan usta (User.id). Berilmasa - servisning hamma ustalariga boradi.
+    master_id: Optional[int] = None
     category: str
     description: Optional[str] = None
     user_latitude: Optional[float] = None
@@ -1586,6 +1592,107 @@ def service_recipient_ids(db: Session, service):
     # Hech kim bo'lmasa (servisda hali usta yo'q) - servis egasiga (admin) boradi.
     return ids or [service.owner_id]
 
+def service_master_users(db: Session, service) -> list:
+    """Servisda ishlaydigan ustalar (User): tasdiqlangan ustalar (ServiceStaff) va
+    egasi usta bo'lgan eski servislarda - o'sha egasi."""
+    users = []
+    seen = set()
+    rows = (
+        db.query(User)
+        .join(ServiceStaff, ServiceStaff.user_id == User.id)
+        .filter(ServiceStaff.service_id == service.id, ServiceStaff.status == "approved", User.is_active == True)
+        .order_by(User.name)
+        .all()
+    )
+    for u in rows:
+        if u.id not in seen:
+            seen.add(u.id)
+            users.append(u)
+    owner = service.owner
+    if owner is not None and owner.role == UserRole.SERVICE_OWNER.value and owner.is_active and owner.id not in seen:
+        users.append(owner)
+    return users
+
+def is_service_master(db: Session, service, user_id: int) -> bool:
+    return any(u.id == user_id for u in service_master_users(db, service))
+
+def master_rating(db: Session, service, user_id: int):
+    """Ustaning shaxsiy reytingi: unga berilgan buyurtmalarga yozilgan sharhlar o'rtachasi.
+    Egasi usta bo'lgan eski servisda (hamma buyurtma usta tanlanmasdan kelgan) - servis reytingi."""
+    rows = (
+        db.query(Review.rating)
+        .join(Order, Order.id == Review.order_id)
+        .filter(Order.service_id == service.id, Order.master_id == user_id)
+        .all()
+    )
+    ratings = [r[0] for r in rows]
+    if service.owner_id == user_id and service.owner is not None and service.owner.role == UserRole.SERVICE_OWNER.value:
+        legacy = (
+            db.query(Review.rating)
+            .join(Order, Order.id == Review.order_id)
+            .filter(Order.service_id == service.id, Order.master_id.is_(None))
+            .all()
+        )
+        ratings += [r[0] for r in legacy]
+    if not ratings:
+        return 0, 0
+    return round(sum(ratings) / len(ratings), 2), len(ratings)
+
+def haversine_km(lat1, lng1, lat2, lng2) -> float:
+    import math
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+def owner_order_filter(service, owner_id: int):
+    """Usta o'z buyurtmalarini ko'radi: o'ziga berilganlar + usta tanlanmagan (umumiy) buyurtmalar."""
+    return (Order.service_id == service.id) & or_(Order.master_id.is_(None), Order.master_id == owner_id)
+
+def order_recipient_ids(db: Session, order) -> list:
+    """Buyurtma/xabar bildirishnomasi kimga: tanlangan ustaga, tanlanmagan bo'lsa servisning barcha ustalariga."""
+    if order.master_id:
+        return [order.master_id]
+    return service_recipient_ids(db, order.service)
+
+def _master_item(db: Session, service, master, lat=None, lng=None) -> dict:
+    rating, review_count = master_rating(db, service, master.id)
+    distance = None
+    if lat is not None and lng is not None and service.latitude is not None and service.longitude is not None:
+        distance = round(haversine_km(lat, lng, service.latitude, service.longitude), 2)
+    return {
+        "master_id": master.id,
+        "name": master.name,
+        "rating": rating,
+        "review_count": review_count,
+        "distance": distance,
+        "service_id": service.id,
+        "service_name": service.name,
+        "service_address": display_service_address(service),
+        "latitude": service.latitude,
+        "longitude": service.longitude,
+        "working_hours": service.working_hours,
+        "day_off": service.day_off,
+        "provider_type": service.provider_type,
+    }
+
+def services_for_service_type(db: Session, service_type_id: int) -> list:
+    """Mijoz tanlagan xizmat turini taklif qiladigan faol avtoservislar."""
+    return (
+        db.query(Service)
+        .join(ServiceOffered, ServiceOffered.service_id == Service.id)
+        .filter(
+            Service.is_active == True,
+            Service.provider_type == "auto_service",
+            ServiceOffered.service_type_id == service_type_id,
+            ServiceOffered.status == "approved",
+            ServiceOffered.is_active == True,
+        )
+        .distinct()
+        .all()
+    )
+
 def get_registrable_service(db: Session, service_id: int):
     """Usta ishlash uchun tanlashi mumkin bo'lgan servis (admin yaratgan, tasdiqlangan avtoservis)."""
     service = db.query(Service).filter(
@@ -2061,7 +2168,7 @@ def get_service_owner_orders(owner_id: int, db: Session = Depends(get_db)):
 
     orders = (
         db.query(Order)
-        .filter(Order.service_id == service.id)
+        .filter(owner_order_filter(service, owner_id))
         .order_by(Order.created_at.desc())
         .all()
     )
@@ -2504,7 +2611,7 @@ def service_owner_dashboard(owner_id: int, db: Session = Depends(get_db)):
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
-    orders = db.query(Order).filter(Order.service_id == service.id).all()
+    orders = db.query(Order).filter(owner_order_filter(service, owner_id)).all()
     today = datetime.datetime.now(datetime.timezone.utc).date()
     active_statuses = {"pending", "accepted"}
 
@@ -2554,7 +2661,7 @@ def service_owner_stats(owner_id: int, period: str = "daily", db: Session = Depe
 
     completed = (
         db.query(Order)
-        .filter(Order.service_id == service.id, Order.status == "completed")
+        .filter(owner_order_filter(service, owner_id), Order.status == "completed")
         .all()
     )
 
@@ -2600,13 +2707,18 @@ def service_owner_reviews(owner_id: int, db: Session = Depends(get_db)):
 
     reviews = (
         db.query(Review)
-        .filter(Review.service_id == service.id)
+        .join(Order, Order.id == Review.order_id)
+        .filter(owner_order_filter(service, owner_id))
         .order_by(Review.created_at.desc())
         .all()
     )
+    if service.owner_id == owner_id:
+        rating, review_count = service.rating, service.review_count
+    else:
+        rating, review_count = master_rating(db, service, owner_id)
     return {
-        "rating": service.rating,
-        "review_count": service.review_count,
+        "rating": rating,
+        "review_count": review_count,
         "reviews": [
             {
                 "id": r.id,
@@ -2911,6 +3023,9 @@ def _perform_account_deletion(user: "User", db: Session):
     db.query(ChatMessage).filter(ChatMessage.sender_id == user.id).delete(synchronize_session=False)
     db.query(Review).filter(Review.user_id == user.id).delete(synchronize_session=False)
 
+    # 4.1) Usta o'chirilsa, unga biriktirilgan buyurtmalar (mijozniki) saqlanadi, faqat usta bog'lanishi bo'shatiladi.
+    db.query(Order).filter(Order.master_id == user.id).update({Order.master_id: None}, synchronize_session=False)
+
     # 5) Foydalanuvchiga bevosita tegishli boshqa jadvallar.
     db.query(Favorite).filter(Favorite.user_id == user.id).delete(synchronize_session=False)
     db.query(Car).filter(Car.user_id == user.id).delete(synchronize_session=False)
@@ -3206,6 +3321,11 @@ def get_services(
 
     services = query.all()
 
+    # Xizmat turi bo'yicha tanlashda mijoz xarita/ro'yxatdan USTA tanlaydi, shuning
+    # uchun hali birorta ustasi yo'q servisni ko'rsatmaymiz.
+    if category and category.isdigit():
+        services = [s for s in services if service_master_users(db, s)]
+
     # Calculate distance if coordinates provided
     result = []
     for s in services:
@@ -3244,6 +3364,55 @@ def get_services(
         result.sort(key=lambda x: x["distance"] or float('inf'))
 
     return result
+
+@app.get("/api/masters")
+def get_masters(
+    category: int,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    db: Session = Depends(get_db),
+):
+    """Mijoz tanlagan xizmat turini ko'rsatadigan servislardagi USTALAR ro'yxati.
+    Mijozga eng yaqin servisdagi ustalar birinchi, eng uzoqdagilari oxirida chiqadi
+    (bitta servisdagi ustalar orasida - reytingi baland usta oldinda)."""
+    items = []
+    for service in services_for_service_type(db, category):
+        for master in service_master_users(db, service):
+            items.append(_master_item(db, service, master, lat, lng))
+    items.sort(key=lambda m: (
+        m["distance"] is None,
+        m["distance"] if m["distance"] is not None else 0,
+        -(m["rating"] or 0),
+        -(m["review_count"] or 0),
+        m["name"] or "",
+    ))
+    return items
+
+@app.get("/api/services/{service_id}/masters")
+def get_service_masters(
+    service_id: int,
+    category: Optional[int] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    db: Session = Depends(get_db),
+):
+    """Bitta servisdagi ustalar (xaritada servis ustiga bosilganda). category berilsa,
+    servis shu xizmat turini ko'rsatmasa ro'yxat bo'sh qaytadi. Reyting bo'yicha: eng yuqori baholangani birinchi."""
+    service = db.query(Service).filter(Service.id == service_id, Service.is_active == True).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Servis topilmadi")
+    if category is not None:
+        offers = db.query(ServiceOffered).filter(
+            ServiceOffered.service_id == service.id,
+            ServiceOffered.service_type_id == category,
+            ServiceOffered.status == "approved",
+            ServiceOffered.is_active == True,
+        ).first()
+        if not offers:
+            return []
+    items = [_master_item(db, service, m, lat, lng) for m in service_master_users(db, service)]
+    items.sort(key=lambda m: (-(m["rating"] or 0), -(m["review_count"] or 0), m["name"] or ""))
+    return items
 
 @app.get("/api/services/{service_id}")
 def get_service_detail(service_id: int, db: Session = Depends(get_db)):
@@ -3365,6 +3534,15 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
 
+    # Avtoservis: mijoz usta tanlagan bo'lsa - u shu servisning tasdiqlangan ustasi bo'lishi shart.
+    master_id = None
+    if order.master_id is not None:
+        if service.provider_type != "auto_service":
+            raise HTTPException(status_code=400, detail="Usta faqat avtoservis uchun tanlanadi")
+        if not is_service_master(db, service, order.master_id):
+            raise HTTPException(status_code=400, detail="Tanlangan usta bu servisda ishlamaydi")
+        master_id = order.master_id
+
     # Evakuator va benzin dastavka uchun narx mijoz yoki servis egasi tomonidan
     # emas, balki admin panelida belgilangan GLOBAL narxlardan avtomatik
     # hisoblanadi - shuning uchun bu yerda qayta hisoblanadi (frontenddan
@@ -3413,6 +3591,7 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     new_order = Order(
         user_id=user_id,
         service_id=order.service_id,
+        master_id=master_id,
         category=order.category,
         description=order.description,
         user_latitude=order.user_latitude,
@@ -3433,7 +3612,7 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     if order_type == "scheduled" and scheduled_at:
         notif_text = f"{user.name} sizga bron qildi ({scheduled_at.strftime('%d.%m.%Y %H:%M')}): {service.name}"
 
-    for recipient in service_recipient_ids(db, service):
+    for recipient in order_recipient_ids(db, new_order):
         create_notification(
             db, recipient,
             "Yangi buyurtma",
@@ -3505,6 +3684,7 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
             "longitude": order.service.longitude,
             "provider_type": order.service.provider_type,
         },
+        "master": {"id": order.master.id, "name": order.master.name} if order.master else None,
         "category": order.category,
         "status": order.status,
         "order_type": order.order_type,
@@ -3579,7 +3759,7 @@ def send_message(sender_id: int, msg: ChatMessageCreate, db: Session = Depends(g
 
     # Xabar qarama-qarshi tomonga (mijoz <-> servis egasi) yuboriladi
     if sender_id == order.user_id:
-        recipient_ids = service_recipient_ids(db, order.service)
+        recipient_ids = order_recipient_ids(db, order)
     else:
         recipient_ids = [order.user_id]
     sender = db.query(User).filter(User.id == sender_id).first()
