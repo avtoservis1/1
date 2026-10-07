@@ -150,6 +150,9 @@ class User(Base):
     # real push bildirishnoma yuborish uchun ishlatiladi (create_notification orqali).
     fcm_token = Column(String(500), nullable=True)
     is_active = Column(Boolean, default=True)
+    # True bo'lsa - akkauntni admin yaratgan (ustaga login/parol SMS bilan yuborilgan):
+    # bunday usta kirishda SMS kod so'ralmaydi va hech qanday ma'lumot kiritmaydi.
+    created_by_admin = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -241,6 +244,11 @@ class ServiceStaff(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     status = Column(String(20), default="pending")
     reject_reason = Column(Text, nullable=True)
+    # Ustaning SHAXSIY sozlamalari - servisniki emas. Admin servisga ish vaqti/dam olish
+    # kuni/telefon kiritmaydi; ularni har bir usta (yoki admin usta nomidan) belgilaydi.
+    phone = Column(String(20), nullable=True)
+    working_hours = Column(String(100), nullable=True)  # "09:00-18:00"
+    day_off = Column(String(50), nullable=True)         # "Yakshanba"
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     service = relationship("Service")
@@ -281,6 +289,9 @@ class ServiceOffered(Base):
     id = Column(Integer, primary_key=True, index=True)
     service_id = Column(Integer, ForeignKey("services.id"), nullable=False)
     service_type_id = Column(Integer, ForeignKey("service_types.id"), nullable=True)
+    # Umumiy (admin yaratgan) servisda xizmat turlarini har bir usta o'zi belgilaydi:
+    # master_id = o'sha usta (User.id). NULL - eski yozuv (servis egasi/evakuator).
+    master_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     category = Column(String(200), nullable=False)  # xizmat nomi (service_type.name dan nusxa)
     price = Column(Float, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -965,6 +976,11 @@ class AdminCreateServiceOwnerRequest(BaseModel):
     working_hours: Optional[str] = None
     logo_base64: Optional[str] = None
     car_model: Optional[str] = None
+    # Avtoservis ustasi uchun: admin ustaning barcha ma'lumotlarini o'zi kiritadi
+    # (usta keyin ularni o'zgartira oladi). Telefon - ustaning aloqa raqami
+    # (berilmasa login raqami olinadi).
+    contact_phone: Optional[str] = None
+    service_type_ids: Optional[List[int]] = None
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -974,17 +990,15 @@ class AdminCreateServiceOwnerRequest(BaseModel):
         return v
 
 class AdminServiceCreateRequest(BaseModel):
-    """Admin yangi (umumiy) avtoservis yaratadi: ustalar keyin shu servislardan birini tanlaydi."""
+    """Admin yangi (umumiy) avtoservis yaratadi: ustalar keyin shu servislardan birini tanlaydi.
+    Ish vaqti, dam olish kuni, telefon va xizmat turlari BU YERDA belgilanmaydi - ularni
+    har bir usta o'zi (yoki admin usta qo'shayotganda) belgilaydi."""
     name: str
-    phone: Optional[str] = None
     address: str
     latitude: float
     longitude: float
-    day_off: Optional[str] = None
-    working_hours: Optional[str] = None
     logo_base64: Optional[str] = None
     description: Optional[str] = None
-    service_type_ids: Optional[List[int]] = None
 
 class ServiceEditRequest(BaseModel):
     name: Optional[str] = None
@@ -1012,6 +1026,12 @@ class OrderEditRequest(BaseModel):
     status: Optional[str] = None
     price: Optional[float] = None
     description: Optional[str] = None
+
+class ServiceOwnerSettingsUpdate(BaseModel):
+    """Usta o'zining shaxsiy sozlamalarini belgilaydi."""
+    phone: Optional[str] = None
+    working_hours: Optional[str] = None
+    day_off: Optional[str] = None
 
 class ServiceOwnerProfileUpdate(BaseModel):
     """Servis egasi 'Profil' bo'limidan o'zi to'ldiradigan maydonlar."""
@@ -1568,6 +1588,58 @@ def get_service_for_owner(db: Session, owner_id: int):
         return membership.service
     return db.query(Service).filter(Service.owner_id == owner_id).order_by(Service.id.desc()).first()
 
+def is_shared_service(service, user_id: int) -> bool:
+    """Admin yaratgan umumiy servis (egasi - admin), usta esa unda ishlaydi."""
+    return service is not None and service.owner_id != user_id
+
+def master_settings(db: Session, service, user_id: int) -> dict:
+    """Ustaning ish vaqti / dam olish kuni / telefoni.
+    Umumiy servisda - ustaning o'z yozuvidan (ServiceStaff); eski servisda (evakuator,
+    benzin, usta egasi bo'lgan servis) - servisning o'zidan."""
+    if service is not None and service.owner_id != user_id:
+        m = db.query(ServiceStaff).filter(
+            ServiceStaff.service_id == service.id, ServiceStaff.user_id == user_id
+        ).order_by(ServiceStaff.id.desc()).first()
+        user = db.query(User).filter(User.id == user_id).first()
+        return {
+            "phone": (m.phone if m and m.phone else (user.phone if user else None)),
+            "working_hours": m.working_hours if m else None,
+            "day_off": m.day_off if m else None,
+        }
+    return {
+        "phone": service.phone if service else None,
+        "working_hours": service.working_hours if service else None,
+        "day_off": service.day_off if service else None,
+    }
+
+def offered_filter(service, user_id: int):
+    """Usta o'z xizmat turlarini ko'radi/boshqaradi: umumiy servisda master_id == usta."""
+    if is_shared_service(service, user_id):
+        return (ServiceOffered.service_id == service.id) & (ServiceOffered.master_id == user_id)
+    return (ServiceOffered.service_id == service.id) & ServiceOffered.master_id.is_(None)
+
+def master_offers_type(db: Session, service, master_id: int, service_type_id: int) -> bool:
+    q = db.query(ServiceOffered.id).filter(
+        ServiceOffered.service_id == service.id,
+        ServiceOffered.service_type_id == service_type_id,
+        ServiceOffered.status == "approved",
+        ServiceOffered.is_active == True,
+    )
+    if service.owner_id == master_id:
+        q = q.filter(or_(ServiceOffered.master_id.is_(None), ServiceOffered.master_id == master_id))
+    else:
+        q = q.filter(ServiceOffered.master_id == master_id)
+    return q.first() is not None
+
+def masters_offering(db: Session, service, service_type_id: int) -> list:
+    return [m for m in service_master_users(db, service) if master_offers_type(db, service, m.id, service_type_id)]
+
+class _HoursView:
+    """_validate_scheduled_within_service_hours uchun yengil obyekt."""
+    def __init__(self, working_hours, day_off):
+        self.working_hours = working_hours
+        self.day_off = day_off
+
 def staff_overrides(db: Session, owner_id: int, service):
     """Umumiy servisda ishlaydigan ustaning ariza holati servisniki emas,
     ustaning o'ziniki (ServiceStaff) bo'ladi."""
@@ -1658,6 +1730,7 @@ def order_recipient_ids(db: Session, order) -> list:
 
 def _master_item(db: Session, service, master, lat=None, lng=None) -> dict:
     rating, review_count = master_rating(db, service, master.id)
+    ms = master_settings(db, service, master.id)
     distance = None
     if lat is not None and lng is not None and service.latitude is not None and service.longitude is not None:
         distance = round(haversine_km(lat, lng, service.latitude, service.longitude), 2)
@@ -1672,8 +1745,9 @@ def _master_item(db: Session, service, master, lat=None, lng=None) -> dict:
         "service_address": display_service_address(service),
         "latitude": service.latitude,
         "longitude": service.longitude,
-        "working_hours": service.working_hours,
-        "day_off": service.day_off,
+        "working_hours": ms["working_hours"],
+        "day_off": ms["day_off"],
+        "phone": ms["phone"],
         "provider_type": service.provider_type,
     }
 
@@ -1912,13 +1986,29 @@ def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Sess
             password_hash=hash_password(request.password),
             role=UserRole.SERVICE_OWNER.value,
             is_active=True,
+            created_by_admin=True,
         )
         db.add(user)
         db.flush()  # user.id kerak
 
         if shared_service is not None:
             service = shared_service
-            db.add(ServiceStaff(service_id=service.id, user_id=user.id, status="approved"))
+            contact = (request.contact_phone or "").strip().replace(" ", "").replace("-", "") or user.phone
+            db.add(ServiceStaff(
+                service_id=service.id, user_id=user.id, status="approved",
+                phone=contact,
+                working_hours=(request.working_hours or None),
+                day_off=(request.day_off or None),
+            ))
+            if request.service_type_ids:
+                for stype in db.query(ServiceType).filter(
+                    ServiceType.id.in_(set(request.service_type_ids)), ServiceType.is_active == True
+                ).all():
+                    db.add(ServiceOffered(
+                        service_id=service.id, service_type_id=stype.id, master_id=user.id,
+                        category=stype.name, price=stype.price_sedan, is_active=True,
+                        status="approved", added_by_admin=True,
+                    ))
         else:
             service = Service(
                 owner_id=user.id,
@@ -1981,12 +2071,10 @@ def admin_create_service(request: AdminServiceCreateRequest, db: Session = Depen
         owner_id=admin_owner_id(db),
         name=name,
         description=request.description,
-        phone=(request.phone or "").strip(),
+        phone="",
         address=address,
         latitude=request.latitude,
         longitude=request.longitude,
-        day_off=request.day_off,
-        working_hours=request.working_hours,
         logo_url=request.logo_base64,
         provider_type="auto_service",
         is_active=True,
@@ -1994,22 +2082,6 @@ def admin_create_service(request: AdminServiceCreateRequest, db: Session = Depen
         status="approved",
     )
     db.add(service)
-    db.flush()
-
-    if request.service_type_ids:
-        stypes = db.query(ServiceType).filter(
-            ServiceType.id.in_(set(request.service_type_ids)), ServiceType.is_active == True
-        ).all()
-        for stype in stypes:
-            db.add(ServiceOffered(
-                service_id=service.id,
-                service_type_id=stype.id,
-                category=stype.name,
-                price=stype.price,
-                is_active=True,
-                status="approved",
-                added_by_admin=True,
-            ))
     db.commit()
     db.refresh(service)
     return {"success": True, "id": service.id, "name": service.name, "message": "Servis qo'shildi"}
@@ -2053,6 +2125,9 @@ def _staff_to_dict(m):
         "service_id": m.service_id,
         "service_name": m.service.name if m.service else "",
         "service_address": display_service_address(m.service) if m.service else "",
+        "working_hours": m.working_hours,
+        "day_off": m.day_off,
+        "contact_phone": m.phone,
         "status": m.status,
         "reject_reason": m.reject_reason,
         "created_at": m.created_at,
@@ -2094,6 +2169,10 @@ def admin_remove_staff(staff_id: int, db: Session = Depends(get_db)):
     m = db.query(ServiceStaff).filter(ServiceStaff.id == staff_id).first()
     if not m:
         raise HTTPException(status_code=404, detail="Usta topilmadi")
+    # Usta servisdan chiqarilsa - shu servisdagi uning xizmat turlari ham o'chadi.
+    db.query(ServiceOffered).filter(
+        ServiceOffered.service_id == m.service_id, ServiceOffered.master_id == m.user_id
+    ).delete(synchronize_session=False)
     db.delete(m)
     db.commit()
     return {"success": True}
@@ -2157,6 +2236,9 @@ def get_service_owner_service(owner_id: int, db: Session = Depends(get_db)):
         "current_longitude": service.current_longitude,
     }
     payload.update(staff_overrides(db, owner_id, service))
+    if is_shared_service(service, owner_id):
+        ms = master_settings(db, service, owner_id)
+        payload.update({"phone": ms["phone"], "working_hours": ms["working_hours"], "day_off": ms["day_off"]})
     return payload
 
 @app.get("/api/service-owner/orders")
@@ -2229,6 +2311,17 @@ def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpda
     # Admin yaratgan umumiy servisning ma'lumotlarini (nomi, manzil, logotip...)
     # faqat admin o'zgartiradi - usta ularni tahrirlay olmaydi.
     shared = service.owner_id != owner_id
+    if shared:
+        # Ish vaqti, dam olish kuni va telefon - ustaning o'zi belgilaydi (servisga tegmaydi).
+        m = get_staff_membership(db, owner_id)
+        if m is not None:
+            data = request.dict(exclude_unset=True)
+            if "working_hours" in data:
+                m.working_hours = data["working_hours"] or None
+            if "day_off" in data:
+                m.day_off = data["day_off"] or None
+            if "phone" in data and data["phone"]:
+                m.phone = data["phone"].replace(" ", "").replace("-", "")
     if not shared:
         data = request.dict(exclude_unset=True)
         logo_base64 = data.pop("logo_base64", None)
@@ -2240,17 +2333,18 @@ def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpda
             owner.name = request.name
     db.commit()
     db.refresh(service)
+    ms = master_settings(db, service, owner_id)
 
     return {
         "success": True,
         "id": service.id,
         "name": service.name,
-        "phone": service.phone,
+        "phone": ms["phone"],
         "address": display_service_address(service),
         "latitude": service.latitude,
         "longitude": service.longitude,
-        "working_hours": service.working_hours,
-        "day_off": service.day_off,
+        "working_hours": ms["working_hours"],
+        "day_off": ms["day_off"],
         "description": service.description,
         "logo_url": service.logo_url,
         "status": service.status,
@@ -2265,7 +2359,7 @@ def list_services_offered(owner_id: int, db: Session = Depends(get_db)):
     service = get_service_for_owner(db, owner_id)
     if not service:
         return []
-    items = db.query(ServiceOffered).filter(ServiceOffered.service_id == service.id).order_by(ServiceOffered.id.desc()).all()
+    items = db.query(ServiceOffered).filter(offered_filter(service, owner_id)).order_by(ServiceOffered.id.desc()).all()
     return [
         {
             "id": i.id,
@@ -2291,7 +2385,7 @@ def upsert_service_offered(owner_id: int, request: ServiceOfferedUpsert, db: Ses
 
     item = (
         db.query(ServiceOffered)
-        .filter(ServiceOffered.service_id == service.id, ServiceOffered.category == request.category)
+        .filter(offered_filter(service, owner_id), ServiceOffered.category == request.category)
         .first()
     )
     if item:
@@ -2300,6 +2394,7 @@ def upsert_service_offered(owner_id: int, request: ServiceOfferedUpsert, db: Ses
     else:
         item = ServiceOffered(
             service_id=service.id,
+            master_id=owner_id if is_shared_service(service, owner_id) else None,
             category=request.category,
             price=request.price,
             is_active=request.is_active,
@@ -2369,7 +2464,7 @@ def list_service_types_for_owner(owner_id: int, db: Session = Depends(get_db)):
     selected = {}
     if service:
         offered = db.query(ServiceOffered).filter(
-            ServiceOffered.service_id == service.id, ServiceOffered.service_type_id.isnot(None)
+            offered_filter(service, owner_id), ServiceOffered.service_type_id.isnot(None)
         ).all()
         selected = {o.service_type_id: o for o in offered}
 
@@ -2404,7 +2499,7 @@ def toggle_service_type(owner_id: int, request: ServiceOwnerTypeToggle, db: Sess
 
     item = (
         db.query(ServiceOffered)
-        .filter(ServiceOffered.service_id == service.id, ServiceOffered.service_type_id == stype.id)
+        .filter(offered_filter(service, owner_id), ServiceOffered.service_type_id == stype.id)
         .first()
     )
     if item:
@@ -2417,6 +2512,7 @@ def toggle_service_type(owner_id: int, request: ServiceOwnerTypeToggle, db: Sess
         item = ServiceOffered(
             service_id=service.id,
             service_type_id=stype.id,
+            master_id=owner_id if is_shared_service(service, owner_id) else None,
             category=stype.name,
             price=stype.price_sedan,
             is_active=request.is_active,
@@ -3031,6 +3127,8 @@ def _perform_account_deletion(user: "User", db: Session):
     db.query(Car).filter(Car.user_id == user.id).delete(synchronize_session=False)
     db.query(Notification).filter(Notification.user_id == user.id).delete(synchronize_session=False)
     db.query(ServiceStaff).filter(ServiceStaff.user_id == user.id).delete(synchronize_session=False)
+    # Ustaning shaxsiy xizmat turlari (FK xatosiga yo'l qo'ymaslik uchun).
+    db.query(ServiceOffered).filter(ServiceOffered.master_id == user.id).delete(synchronize_session=False)
 
     # 6) Endi buyurtmalarning o'zini o'chirish mumkin (chat/sharh allaqachon tozalandi).
     if order_ids:
@@ -3324,7 +3422,7 @@ def get_services(
     # Xizmat turi bo'yicha tanlashda mijoz xarita/ro'yxatdan USTA tanlaydi, shuning
     # uchun hali birorta ustasi yo'q servisni ko'rsatmaymiz.
     if category and category.isdigit():
-        services = [s for s in services if service_master_users(db, s)]
+        services = [s for s in services if masters_offering(db, s, int(category))]
 
     # Calculate distance if coordinates provided
     result = []
@@ -3377,7 +3475,7 @@ def get_masters(
     (bitta servisdagi ustalar orasida - reytingi baland usta oldinda)."""
     items = []
     for service in services_for_service_type(db, category):
-        for master in service_master_users(db, service):
+        for master in masters_offering(db, service, category):
             items.append(_master_item(db, service, master, lat, lng))
     items.sort(key=lambda m: (
         m["distance"] is None,
@@ -3401,16 +3499,8 @@ def get_service_masters(
     service = db.query(Service).filter(Service.id == service_id, Service.is_active == True).first()
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
-    if category is not None:
-        offers = db.query(ServiceOffered).filter(
-            ServiceOffered.service_id == service.id,
-            ServiceOffered.service_type_id == category,
-            ServiceOffered.status == "approved",
-            ServiceOffered.is_active == True,
-        ).first()
-        if not offers:
-            return []
-    items = [_master_item(db, service, m, lat, lng) for m in service_master_users(db, service)]
+    masters = masters_offering(db, service, category) if category is not None else service_master_users(db, service)
+    items = [_master_item(db, service, m, lat, lng) for m in masters]
     items.sort(key=lambda m: (-(m["rating"] or 0), -(m["review_count"] or 0), m["name"] or ""))
     return items
 
@@ -3586,7 +3676,11 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     # tashqariga to'g'ri kelmasligini tekshiramiz (faqat oddiy avtoservis
     # uchun - evakuator/benzin yuqorida allaqachon "now"ga majburlangan).
     if order_type == "scheduled" and scheduled_at:
-        _validate_scheduled_within_service_hours(service, scheduled_at)
+        if master_id and is_shared_service(service, master_id):
+            ms = master_settings(db, service, master_id)
+            _validate_scheduled_within_service_hours(_HoursView(ms["working_hours"], ms["day_off"]), scheduled_at)
+        else:
+            _validate_scheduled_within_service_hours(service, scheduled_at)
 
     new_order = Order(
         user_id=user_id,
@@ -4441,17 +4535,18 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
     service = get_service_for_owner(db, owner_id)
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
+    ms = master_settings(db, service, owner_id)
     return {
         "owner": {"id": owner.id, "name": owner.name, "phone": owner.phone},
         "service": {
             "id": service.id,
             "name": service.name,
-            "phone": service.phone,
+            "phone": ms["phone"],
             "address": display_service_address(service),
             "latitude": service.latitude,
             "longitude": service.longitude,
-            "working_hours": service.working_hours,
-            "day_off": service.day_off,
+            "working_hours": ms["working_hours"],
+            "day_off": ms["day_off"],
             "description": service.description,
             "logo_url": service.logo_url,
             "rating": service.rating,
