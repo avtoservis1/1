@@ -2993,6 +2993,51 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     return response
 
 
+# Apple App Store / Google Play reviewer akkaunti (usta ilovasi): bu raqam uchun
+# parol ham, SMS ham so'ralmaydi - ilova shu endpointga faqat telefonni yuboradi.
+# DIQQAT: bu akkauntga raqamni biladigan har kim kira oladi, shuning uchun unda
+# haqiqiy ma'lumot bo'lmasin (faqat test uchun ishlating).
+REVIEWER_OWNER_PHONE = "+998889791000"
+
+class ReviewerLoginRequest(BaseModel):
+    phone: str
+
+@app.post("/api/login/reviewer")
+def reviewer_login(request: ReviewerLoginRequest, db: Session = Depends(get_db)):
+    phone = (request.phone or "").strip()
+    if phone != REVIEWER_OWNER_PHONE:
+        raise HTTPException(status_code=403, detail="Bu raqam uchun tezkor kirish yoqilmagan")
+
+    user = db.query(User).filter(User.phone == phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Test akkaunt topilmadi")
+
+    # Reviewer har doim ishlaydigan, tasdiqlangan usta akkauntiga kirishi kerak.
+    user.is_active = True
+    user.role = UserRole.SERVICE_OWNER.value
+    membership = get_staff_membership(db, user.id)
+    if membership is not None:
+        if membership.status != "approved":
+            membership.status = "approved"
+            membership.reject_reason = None
+    else:
+        own = db.query(Service).filter(Service.owner_id == user.id).order_by(Service.id.desc()).first()
+        if own is not None and (own.status != "approved" or not own.is_active):
+            own.status = "approved"
+            own.is_verified = True
+            own.is_active = True
+            own.reject_reason = None
+    db.commit()
+
+    return {
+        "success": True,
+        "token": generate_token(user.id),
+        "user_id": user.id,
+        "name": user.name,
+        "phone": user.phone,
+        "role": user.role,
+    }
+
 @app.post("/api/login/verify-otp")
 def login_verify_otp(request: OTPVerifyRequest, db: Session = Depends(get_db)):
     """Login - 2-bosqich: SMS kodni tasdiqlab, kirish tokenini qaytaradi."""
