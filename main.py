@@ -1845,6 +1845,23 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
             membership.service_id = shared_service.id
             membership.status = "pending"
             membership.reject_reason = None
+        # Usta o'z ish vaqti, dam olish kuni, telefoni va xizmat turlarini o'zi belgilaydi.
+        membership.phone = request.phone
+        membership.working_hours = request.working_hours or None
+        membership.day_off = request.day_off or None
+        if request.service_type_ids is not None:
+            db.query(ServiceOffered).filter(
+                ServiceOffered.service_id == shared_service.id,
+                ServiceOffered.master_id == user.id,
+            ).delete(synchronize_session=False)
+            for stype in db.query(ServiceType).filter(
+                ServiceType.id.in_(set(request.service_type_ids)), ServiceType.is_active == True
+            ).all():
+                db.add(ServiceOffered(
+                    service_id=shared_service.id, service_type_id=stype.id, master_id=user.id,
+                    category=stype.name, price=stype.price_sedan, is_active=True,
+                    status="approved", added_by_admin=False,
+                ))
         db.commit()
         db.refresh(membership)
 
