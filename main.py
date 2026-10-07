@@ -1138,6 +1138,8 @@ class OrderCreate(BaseModel):
     # order_type == "scheduled" bo'lganda majburiy - ISO 8601 format
     # (masalan "2026-08-01T14:00:00").
     scheduled_at: Optional[datetime.datetime] = None
+    # Ixtiyoriy: "Sedan" | "Krossover" - narx shunga qarab hisoblanadi (berilmasa sedan).
+    car_type: Optional[str] = None
 
     @validator("order_type")
     def validate_order_type(cls, v):
@@ -1721,6 +1723,65 @@ def haversine_km(lat1, lng1, lat2, lng2) -> float:
 def owner_order_filter(service, owner_id: int):
     """Usta o'z buyurtmalarini ko'radi: o'ziga berilganlar + usta tanlanmagan (umumiy) buyurtmalar."""
     return (Order.service_id == service.id) & or_(Order.master_id.is_(None), Order.master_id == owner_id)
+
+def compute_category_price(db: Session, category: str, car_type: Optional[str] = None) -> float:
+    """Avtoservis buyurtmasining narxi: mijoz tanlagan BARCHA xizmat turlari narxlarining
+    yig'indisi. `category` - xizmat turlari nomlari vergul bilan ("Motor diagnostikasi, Yog' almashtirish")
+    yoki raqamli ServiceType id'lari. Narx admin belgilagan ServiceType narxlaridan olinadi
+    (krossover bo'lsa price_crossover, aks holda price_sedan)."""
+    if not category:
+        return 0.0
+    tokens = [t.strip().lower() for t in str(category).split(",") if t.strip()]
+    if not tokens:
+        return 0.0
+    crossover = (car_type or "").strip().lower() in ("krossover", "crossover")
+    by_name = {}
+    by_id = {}
+    for st in db.query(ServiceType).all():
+        by_name.setdefault((st.name or "").strip().lower(), st)
+        by_id[str(st.id)] = st
+    total = 0.0
+    seen = set()
+    for tok in tokens:
+        st = by_name.get(tok) or (by_id.get(tok) if tok.isdigit() else None)
+        if st is None or st.id in seen:
+            continue
+        seen.add(st.id)
+        if crossover and st.price_crossover:
+            total += st.price_crossover
+        else:
+            total += (st.price_sedan if st.price_sedan is not None else (st.price or 0)) or 0
+    return float(total)
+
+def ensure_order_price(db: Session, order) -> bool:
+    """Avtoservis buyurtmasida narx yo'q (None/0) bo'lsa - xizmat turlaridan hisoblab yozadi."""
+    if order.price:
+        return False
+    service = order.service
+    if service is None or service.provider_type != "auto_service":
+        return False
+    price = compute_category_price(db, order.category)
+    if price > 0:
+        order.price = price
+        return True
+    return False
+
+def backfill_order_prices():
+    """Eski buyurtmalarda (price=NULL) narxni xizmat turlaridan to'ldiradi - daromad 0 bo'lib qolmasligi uchun."""
+    db = SessionLocal()
+    try:
+        changed = 0
+        for o in db.query(Order).filter(or_(Order.price.is_(None), Order.price == 0)).all():
+            if ensure_order_price(db, o):
+                changed += 1
+        if changed:
+            db.commit()
+            logging.getLogger("uvicorn.error").warning(f"[backfill] {changed} ta buyurtma narxi hisoblandi")
+    except Exception as e:
+        db.rollback()
+        logging.getLogger("uvicorn.error").error(f"[backfill] xatolik: {e}")
+    finally:
+        db.close()
 
 def order_recipient_ids(db: Session, order) -> list:
     """Buyurtma/xabar bildirishnomasi kimga: tanlangan ustaga, tanlanmagan bo'lsa servisning barcha ustalariga."""
@@ -3680,6 +3741,10 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
         liters = order.liters
         computed_price = delivery_fee + liters * (price_per_liter or 0)
 
+    # Avtoservis: narx = tanlangan barcha xizmat turlari narxlari yig'indisi.
+    if service.provider_type == "auto_service":
+        computed_price = compute_category_price(db, order.category, order.car_type) or None
+
     # Evakuator/benzin dastavka - har doim "hozir" turidagi chaqiruv,
     # bron qilib bo'lmaydi (mijoz frontend orqali order_type yubormasa ham
     # xavfsizlik uchun bu yerda majburlab qo'yiladi).
@@ -3825,6 +3890,9 @@ def update_order_status(order_id: int, update: OrderStatusUpdate, db: Session = 
     order.status = update.status
     if update.status == OrderStatus.COMPLETED.value:
         order.completed_at = datetime.datetime.utcnow()
+        # Narx hali yozilmagan bo'lsa (eski buyurtmalar) - xizmat turlaridan hisoblaymiz,
+        # shunda usta/admin daromadiga to'g'ri qo'shiladi.
+        ensure_order_price(db, order)
 
     db.commit()
     db.refresh(order)
@@ -4472,12 +4540,87 @@ def admin_statistics(db: Session = Depends(get_db)):
         "count": active_service[1],
     } if active_service else None
 
+    # ---- Daromad: jami, har bir servis va har bir usta bo'yicha ----
+    all_services = db.query(Service).all()
+    svc_map = {sv.id: sv for sv in all_services}
+    svc_stats = {sv.id: {"orders": 0, "completed": 0, "revenue": 0.0} for sv in all_services}
+    approved_counts = dict(
+        db.query(ServiceStaff.service_id, func.count(ServiceStaff.id))
+        .filter(ServiceStaff.status == "approved")
+        .group_by(ServiceStaff.service_id).all()
+    )
+
+    master_stats = {}
+    for u in db.query(User).filter(User.role == UserRole.SERVICE_OWNER.value).all():
+        own = get_service_for_owner(db, u.id)
+        master_stats[u.id] = {
+            "user_id": u.id,
+            "name": u.name,
+            "phone": u.phone,
+            "service_id": own.id if own else None,
+            "service_name": own.name if own else None,
+            "provider_type": own.provider_type if own else None,
+            "orders": 0, "completed": 0, "revenue": 0.0,
+        }
+
+    total_orders = 0
+    total_completed = 0
+    total_revenue = 0.0
+    for o in db.query(Order).all():
+        total_orders += 1
+        done = o.status == "completed"
+        amount = (o.price or 0) if done else 0
+        st = svc_stats.get(o.service_id)
+        if st is not None:
+            st["orders"] += 1
+            if done:
+                st["completed"] += 1
+                st["revenue"] += amount
+        mid = o.master_id
+        if mid is None:
+            sv = svc_map.get(o.service_id)
+            if sv is not None and sv.owner_id in master_stats:
+                mid = sv.owner_id
+        ms = master_stats.get(mid)
+        if ms is not None:
+            ms["orders"] += 1
+            if done:
+                ms["completed"] += 1
+                ms["revenue"] += amount
+        if done:
+            total_completed += 1
+            total_revenue += amount
+
+    services_revenue = sorted(
+        [
+            {
+                "id": sv.id,
+                "name": sv.name,
+                "provider_type": sv.provider_type,
+                "staff_count": approved_counts.get(sv.id, 0),
+                **svc_stats[sv.id],
+            }
+            for sv in all_services
+        ],
+        key=lambda r: (r["revenue"], r["completed"]), reverse=True,
+    )
+    masters_revenue = sorted(
+        master_stats.values(), key=lambda r: (r["revenue"], r["completed"]), reverse=True
+    )
+
     return {
         "daily": daily,
         "weekly": weekly,
         "monthly": monthly,
         "most_popular_service": most_popular_service,
         "most_active_service": most_active_service,
+        "revenue_totals": {
+            "total_revenue": total_revenue,
+            "completed_orders": total_completed,
+            "total_orders": total_orders,
+        },
+        "services_revenue": services_revenue,
+        "masters_revenue": masters_revenue,
     }
 
 # ============================================
@@ -4920,6 +5063,9 @@ def delete_notification(notification_id: int, db: Session = Depends(get_db)):
     db.delete(notif)
     db.commit()
     return {"success": True}
+
+# Ilova ishga tushganda narxi yozilmagan eski buyurtmalarni to'ldirib qo'yamiz.
+backfill_order_prices()
 
 if __name__ == "__main__":
     import uvicorn
