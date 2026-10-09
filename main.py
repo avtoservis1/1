@@ -3894,18 +3894,24 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
             "lng": order.service.current_longitude,
         }
 
+    # Umumiy servisda telefon servisda emas, ustaning o'zida turadi (ServiceStaff.phone).
+    # Usta tanlangan bo'lsa - shu ustaning raqami, bo'lmasa servisniki.
+    contact_phone = order.service.phone
+    if order.master:
+        contact_phone = master_settings(db, order.service, order.master.id).get("phone") or contact_phone
+
     return {
         "id": order.id,
         "service": {
             "id": order.service.id,
             "name": order.service.name,
-            "phone": order.service.phone,
+            "phone": contact_phone,
             "address": display_service_address(order.service),
             "latitude": order.service.latitude,
             "longitude": order.service.longitude,
             "provider_type": order.service.provider_type,
         },
-        "master": {"id": order.master.id, "name": order.master.name} if order.master else None,
+        "master": {"id": order.master.id, "name": order.master.name, "phone": contact_phone} if order.master else None,
         "category": order.category,
         "status": order.status,
         "order_type": order.order_type,
