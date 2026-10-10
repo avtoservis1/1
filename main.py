@@ -249,10 +249,22 @@ class ServiceStaff(Base):
     phone = Column(String(20), nullable=True)
     working_hours = Column(String(100), nullable=True)  # "09:00-18:00"
     day_off = Column(String(50), nullable=True)         # "Yakshanba"
+    profession_id = Column(Integer, nullable=True, index=True)  # Profession.id - ustaning kasbi
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     service = relationship("Service")
     user = relationship("User")
+
+class Profession(Base):
+    """Usta kasblari katalogi (masalan "Motorist", "Elektrik"). Faqat NOMI bor -
+    uni FAQAT admin qo'shadi/tahrirlaydi. Usta ro'yxatdan o'tishda shulardan birini
+    tanlaydi va mijozga ustaning ismi ostida ko'rsatiladi."""
+    __tablename__ = "professions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class ServiceType(Base):
     """
@@ -949,6 +961,8 @@ class ServiceOwnerRegisterRequest(BaseModel):
     service_type_ids: Optional[List[int]] = None
     # auto_service uchun: usta ishlaydigan, admin yaratgan servisning ID'si.
     service_id: Optional[int] = None
+    # auto_service uchun: admin kiritgan kasblardan biri (Profession.id).
+    profession_id: Optional[int] = None
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -981,6 +995,7 @@ class AdminCreateServiceOwnerRequest(BaseModel):
     # (berilmasa login raqami olinadi).
     contact_phone: Optional[str] = None
     service_type_ids: Optional[List[int]] = None
+    profession_id: Optional[int] = None  # admin ustaga kasb tanlaydi (Profession.id)
 
     @validator('phone')
     def validate_phone(cls, v):
@@ -1044,6 +1059,14 @@ class ServiceOwnerProfileUpdate(BaseModel):
     day_off: Optional[str] = None
     description: Optional[str] = None
     logo_base64: Optional[str] = None
+    profession_id: Optional[int] = None
+
+class ProfessionCreate(BaseModel):
+    name: str
+
+class ProfessionUpdate(BaseModel):
+    name: Optional[str] = None
+    is_active: Optional[bool] = None
 
 class ChangePasswordRequest(BaseModel):
     """Har qanday rol (user / service_owner / admin) o'z kirish parolini
@@ -1594,6 +1617,25 @@ def is_shared_service(service, user_id: int) -> bool:
     """Admin yaratgan umumiy servis (egasi - admin), usta esa unda ishlaydi."""
     return service is not None and service.owner_id != user_id
 
+def profession_name(db: Session, profession_id) -> Optional[str]:
+    if not profession_id:
+        return None
+    p = db.query(Profession).filter(Profession.id == profession_id).first()
+    return p.name if p else None
+
+def resolve_profession_id(db: Session, profession_id, required: bool):
+    """Kasb ID'sini tekshiradi. Admin kasblar qo'shgan bo'lsa va required=True bo'lsa -
+    kasb tanlash majburiy. Kasblar hali yo'q bo'lsa, tanlov talab qilinmaydi."""
+    has_any = db.query(Profession.id).filter(Profession.is_active == True).first() is not None
+    if profession_id is None:
+        if required and has_any:
+            raise HTTPException(status_code=400, detail="Kasbingizni tanlang")
+        return None
+    p = db.query(Profession).filter(Profession.id == profession_id, Profession.is_active == True).first()
+    if not p:
+        raise HTTPException(status_code=400, detail="Tanlangan kasb topilmadi")
+    return p.id
+
 def master_settings(db: Session, service, user_id: int) -> dict:
     """Ustaning ish vaqti / dam olish kuni / telefoni.
     Umumiy servisda - ustaning o'z yozuvidan (ServiceStaff); eski servisda (evakuator,
@@ -1607,11 +1649,15 @@ def master_settings(db: Session, service, user_id: int) -> dict:
             "phone": (m.phone if m and m.phone else (user.phone if user else None)),
             "working_hours": m.working_hours if m else None,
             "day_off": m.day_off if m else None,
+            "profession_id": m.profession_id if m else None,
+            "profession": profession_name(db, m.profession_id) if m else None,
         }
     return {
         "phone": service.phone if service else None,
         "working_hours": service.working_hours if service else None,
         "day_off": service.day_off if service else None,
+        "profession_id": None,
+        "profession": None,
     }
 
 def offered_filter(service, user_id: int):
@@ -1809,6 +1855,7 @@ def _master_item(db: Session, service, master, lat=None, lng=None) -> dict:
         "working_hours": ms["working_hours"],
         "day_off": ms["day_off"],
         "phone": ms["phone"],
+        "profession": ms.get("profession"),
         "provider_type": service.provider_type,
     }
 
@@ -1862,6 +1909,8 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
         if request.service_id is None:
             raise HTTPException(status_code=400, detail="Ishlaydigan servisni tanlang")
         shared_service = get_registrable_service(db, request.service_id)
+        # Usta admin kiritgan kasblardan birini tanlashi shart.
+        profession_id = resolve_profession_id(db, request.profession_id, required=True)
     else:
         if not request.car_model:
             raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
@@ -1900,7 +1949,7 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
         # biriktiriladi va admin tasdig'ini kutadi.
         membership = get_staff_membership(db, user.id)
         if membership is None:
-            membership = ServiceStaff(service_id=shared_service.id, user_id=user.id, status="pending")
+            membership = ServiceStaff(service_id=shared_service.id, user_id=user.id, status="pending", profession_id=profession_id)
             db.add(membership)
         else:
             membership.service_id = shared_service.id
@@ -1908,6 +1957,7 @@ def register_service_owner(request: ServiceOwnerRegisterRequest, db: Session = D
             membership.reject_reason = None
         # Usta o'z ish vaqti, dam olish kuni, telefoni va xizmat turlarini o'zi belgilaydi.
         membership.phone = request.phone
+        membership.profession_id = profession_id
         membership.working_hours = request.working_hours or None
         membership.day_off = request.day_off or None
         if request.service_type_ids is not None:
@@ -2047,6 +2097,7 @@ def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Sess
         if request.service_id is None:
             raise HTTPException(status_code=400, detail="Ustani biriktirish uchun servisni tanlang")
         shared_service = get_registrable_service(db, request.service_id)
+        profession_id = resolve_profession_id(db, request.profession_id, required=False)
     elif not request.car_model or not request.car_model.strip():
         raise HTTPException(status_code=400, detail="Mashina rusmi (turi) kiritilishi shart")
 
@@ -2077,6 +2128,7 @@ def admin_create_service_owner(request: AdminCreateServiceOwnerRequest, db: Sess
                 phone=contact,
                 working_hours=(request.working_hours or None),
                 day_off=(request.day_off or None),
+                profession_id=profession_id,
             ))
             if request.service_type_ids:
                 for stype in db.query(ServiceType).filter(
@@ -2400,8 +2452,11 @@ def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpda
                 m.day_off = data["day_off"] or None
             if "phone" in data and data["phone"]:
                 m.phone = data["phone"].replace(" ", "").replace("-", "")
+            if data.get("profession_id"):
+                m.profession_id = resolve_profession_id(db, data["profession_id"], required=False)
     if not shared:
         data = request.dict(exclude_unset=True)
+        data.pop("profession_id", None)  # kasb faqat umumiy servis ustalari uchun
         logo_base64 = data.pop("logo_base64", None)
         for field, value in data.items():
             setattr(service, field, value)
@@ -2607,6 +2662,70 @@ def toggle_service_type(owner_id: int, request: ServiceOwnerTypeToggle, db: Sess
         "price": item.price,
         "is_active": item.is_active,
     }
+
+# ============================================
+# KASBLAR (faqat nom) - admin qo'shadi, usta ro'yxatdan o'tishda tanlaydi
+# ============================================
+@app.get("/api/professions")
+def list_professions(db: Session = Depends(get_db)):
+    """Ro'yxatdan o'tishda ustaga ko'rsatiladigan faol kasblar."""
+    items = db.query(Profession).filter(Profession.is_active == True).order_by(Profession.name.asc()).all()
+    return [{"id": p.id, "name": p.name} for p in items]
+
+@app.get("/api/admin/professions")
+def admin_list_professions(db: Session = Depends(get_db)):
+    items = db.query(Profession).order_by(Profession.id.desc()).all()
+    counts = dict(
+        db.query(ServiceStaff.profession_id, func.count(ServiceStaff.id))
+        .filter(ServiceStaff.profession_id.isnot(None))
+        .group_by(ServiceStaff.profession_id).all()
+    )
+    return [
+        {"id": p.id, "name": p.name, "is_active": p.is_active, "masters_count": counts.get(p.id, 0)}
+        for p in items
+    ]
+
+@app.post("/api/admin/professions")
+def admin_create_profession(request: ProfessionCreate, db: Session = Depends(get_db)):
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Kasb nomi bo'sh bo'lishi mumkin emas")
+    if db.query(Profession).filter(func.lower(Profession.name) == name.lower()).first():
+        raise HTTPException(status_code=400, detail="Bu kasb allaqachon mavjud")
+    p = Profession(name=name, is_active=True)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return {"id": p.id, "name": p.name, "is_active": p.is_active, "masters_count": 0}
+
+@app.put("/api/admin/professions/{profession_id}")
+def admin_update_profession(profession_id: int, request: ProfessionUpdate, db: Session = Depends(get_db)):
+    p = db.query(Profession).filter(Profession.id == profession_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Kasb topilmadi")
+    if request.name is not None and request.name.strip():
+        new_name = request.name.strip()
+        dup = db.query(Profession).filter(
+            func.lower(Profession.name) == new_name.lower(), Profession.id != p.id).first()
+        if dup:
+            raise HTTPException(status_code=400, detail="Bu kasb allaqachon mavjud")
+        p.name = new_name
+    if request.is_active is not None:
+        p.is_active = request.is_active
+    db.commit()
+    return {"id": p.id, "name": p.name, "is_active": p.is_active}
+
+@app.delete("/api/admin/professions/{profession_id}")
+def admin_delete_profession(profession_id: int, db: Session = Depends(get_db)):
+    p = db.query(Profession).filter(Profession.id == profession_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Kasb topilmadi")
+    # Shu kasbdagi ustalar o'chmaydi - ularning kasbi bo'sh qoladi.
+    db.query(ServiceStaff).filter(ServiceStaff.profession_id == p.id).update(
+        {"profession_id": None}, synchronize_session=False)
+    db.delete(p)
+    db.commit()
+    return {"success": True}
 
 # ============================================
 # ADMIN: XIZMAT TURLARI KATALOGINI BOSHQARISH
@@ -3932,6 +4051,27 @@ def get_order_detail(order_id: int, db: Session = Depends(get_db)):
         ]
     }
 
+def notify_customer_order_status(db: Session, order) -> None:
+    """Buyurtma holati o'zgarganda mijozga bildirishnoma (va push) yuboradi.
+    Usta ham, admin ham holatni o'zgartirganda shu funksiya chaqiriladi."""
+    if order.status == OrderStatus.COMPLETED.value:
+        # Buyurtma yakunlanganda mijozni xizmatni baholashga taklif qilamiz
+        # (barcha provayder turlari uchun: avto servis, evakuator, benzin yetkazish).
+        create_notification(
+            db, order.user_id,
+            "Buyurtma yakunlandi ⭐",
+            "Xizmat yakunlandi. Iltimos, xizmatga baho bering va fikringizni qoldiring!",
+            type="review", related_id=order.id,
+        )
+    else:
+        status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
+        create_notification(
+            db, order.user_id,
+            "Buyurtma holati yangilandi",
+            f"Buyurtmangiz holati: {status_label}",
+            type="order_status", related_id=order.id,
+        )
+
 @app.put("/api/orders/{order_id}/status")
 def update_order_status(order_id: int, update: OrderStatusUpdate, db: Session = Depends(get_db)):
     order = db.query(Order).filter(Order.id == order_id).first()
@@ -3948,24 +4088,7 @@ def update_order_status(order_id: int, update: OrderStatusUpdate, db: Session = 
     db.commit()
     db.refresh(order)
 
-    if order.status == OrderStatus.COMPLETED.value:
-        # Buyurtma yakunlanganda mijozga alohida bildirishnoma yuborib,
-        # xizmatni baholashga taklif qilamiz (barcha provayder turlari uchun:
-        # avto servis, evakuator, benzin yetkazish).
-        create_notification(
-            db, order.user_id,
-            "Buyurtma yakunlandi ⭐",
-            "Xizmat yakunlandi. Iltimos, xizmatga baho bering va fikringizni qoldiring!",
-            type="review", related_id=order.id,
-        )
-    else:
-        status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
-        create_notification(
-            db, order.user_id,
-            "Buyurtma holati yangilandi",
-            f"Buyurtmangiz holati: {status_label}",
-            type="order_status", related_id=order.id,
-        )
+    notify_customer_order_status(db, order)
 
     return {"id": order.id, "status": order.status}
 
@@ -4259,10 +4382,12 @@ def admin_edit_order(order_id: int, request: OrderEditRequest, db: Session = Dep
     if not order:
         raise HTTPException(status_code=404, detail="Buyurtma topilmadi")
 
+    status_changed = False
     if request.status is not None:
         valid_statuses = ["pending", "accepted", "completed", "cancelled"]
         if request.status not in valid_statuses:
             raise HTTPException(status_code=400, detail="Noto'g'ri holat qiymati")
+        status_changed = order.status != request.status
         order.status = request.status
         if request.status == "completed" and order.completed_at is None:
             order.completed_at = func.now()
@@ -4273,6 +4398,9 @@ def admin_edit_order(order_id: int, request: OrderEditRequest, db: Session = Dep
 
     db.commit()
     db.refresh(order)
+    # Admin holatni o'zgartirganda ham mijozga bildirishnoma/push boradi
+    if status_changed:
+        notify_customer_order_status(db, order)
     return {"id": order.id, "status": order.status, "price": order.price, "message": "Buyurtma yangilandi"}
 
 @app.delete("/api/admin/orders/{order_id}")
@@ -4748,7 +4876,8 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Servis topilmadi")
     ms = master_settings(db, service, owner_id)
     return {
-        "owner": {"id": owner.id, "name": owner.name, "phone": owner.phone},
+        "owner": {"id": owner.id, "name": owner.name, "phone": owner.phone,
+                  "profession_id": ms.get("profession_id"), "profession": ms.get("profession")},
         "service": {
             "id": service.id,
             "name": service.name,
