@@ -250,6 +250,7 @@ class ServiceStaff(Base):
     working_hours = Column(String(100), nullable=True)  # "09:00-18:00"
     day_off = Column(String(50), nullable=True)         # "Yakshanba"
     profession_id = Column(Integer, nullable=True, index=True)  # Profession.id - ustaning kasbi
+    experience_years = Column(Integer, nullable=True)  # ustaning ish tajribasi (yil)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     service = relationship("Service")
@@ -1060,6 +1061,7 @@ class ServiceOwnerProfileUpdate(BaseModel):
     description: Optional[str] = None
     logo_base64: Optional[str] = None
     profession_id: Optional[int] = None
+    experience_years: Optional[int] = None
 
 class ProfessionCreate(BaseModel):
     name: str
@@ -1651,6 +1653,7 @@ def master_settings(db: Session, service, user_id: int) -> dict:
             "day_off": m.day_off if m else None,
             "profession_id": m.profession_id if m else None,
             "profession": profession_name(db, m.profession_id) if m else None,
+            "experience_years": m.experience_years if m else None,
         }
     return {
         "phone": service.phone if service else None,
@@ -1658,6 +1661,7 @@ def master_settings(db: Session, service, user_id: int) -> dict:
         "day_off": service.day_off if service else None,
         "profession_id": None,
         "profession": None,
+        "experience_years": None,
     }
 
 def offered_filter(service, user_id: int):
@@ -1856,6 +1860,7 @@ def _master_item(db: Session, service, master, lat=None, lng=None) -> dict:
         "day_off": ms["day_off"],
         "phone": ms["phone"],
         "profession": ms.get("profession"),
+        "experience_years": ms.get("experience_years"),
         "provider_type": service.provider_type,
     }
 
@@ -2454,9 +2459,15 @@ def update_service_owner_profile(owner_id: int, request: ServiceOwnerProfileUpda
                 m.phone = data["phone"].replace(" ", "").replace("-", "")
             if data.get("profession_id"):
                 m.profession_id = resolve_profession_id(db, data["profession_id"], required=False)
+            if "experience_years" in data:
+                ey = data["experience_years"]
+                if ey is not None and (ey < 0 or ey > 60):
+                    raise HTTPException(status_code=400, detail="Tajriba 0 dan 60 yilgacha bo'lishi kerak")
+                m.experience_years = ey
     if not shared:
         data = request.dict(exclude_unset=True)
-        data.pop("profession_id", None)  # kasb faqat umumiy servis ustalari uchun
+        data.pop("profession_id", None)  # kasb va tajriba faqat umumiy servis ustalari uchun
+        data.pop("experience_years", None)
         logo_base64 = data.pop("logo_base64", None)
         for field, value in data.items():
             setattr(service, field, value)
@@ -3707,7 +3718,7 @@ def get_services(
 
 @app.get("/api/masters")
 def get_masters(
-    category: int,
+    category: Optional[int] = None,
     lat: Optional[float] = None,
     lng: Optional[float] = None,
     db: Session = Depends(get_db),
@@ -3716,9 +3727,21 @@ def get_masters(
     Mijozga eng yaqin servisdagi ustalar birinchi, eng uzoqdagilari oxirida chiqadi
     (bitta servisdagi ustalar orasida - reytingi baland usta oldinda)."""
     items = []
-    for service in services_for_service_type(db, category):
-        for master in masters_offering(db, service, category):
-            items.append(_master_item(db, service, master, lat, lng))
+    if category is None:
+        # Xizmat turi berilmasa (mijoz ilovasidagi "Kategoriya bo'yicha" bo'limi):
+        # barcha faol avtoservislardagi tasdiqlangan ustalar.
+        services = db.query(Service).filter(
+            Service.is_active == True,
+            Service.provider_type == "auto_service",
+            Service.status == "approved",
+        ).all()
+        for service in services:
+            for master in service_master_users(db, service):
+                items.append(_master_item(db, service, master, lat, lng))
+    else:
+        for service in services_for_service_type(db, category):
+            for master in masters_offering(db, service, category):
+                items.append(_master_item(db, service, master, lat, lng))
     items.sort(key=lambda m: (
         m["distance"] is None,
         m["distance"] if m["distance"] is not None else 0,
@@ -4877,7 +4900,8 @@ def get_service_owner_profile(owner_id: int, db: Session = Depends(get_db)):
     ms = master_settings(db, service, owner_id)
     return {
         "owner": {"id": owner.id, "name": owner.name, "phone": owner.phone,
-                  "profession_id": ms.get("profession_id"), "profession": ms.get("profession")},
+                  "profession_id": ms.get("profession_id"), "profession": ms.get("profession"),
+                  "experience_years": ms.get("experience_years")},
         "service": {
             "id": service.id,
             "name": service.name,
