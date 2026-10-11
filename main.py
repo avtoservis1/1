@@ -1288,13 +1288,28 @@ def _phone_recently_verified(db: Session, phone: str, minutes: int = 30) -> bool
 # startup if it doesn't exist yet. Login is via the normal /api/login
 # endpoint with the phone + password below; the response's `role` field
 # will be "admin" and admin_main.dart's AdminApi.login() accepts it.
-DEFAULT_ADMIN_PHONE = "+998901234567"
+DEFAULT_ADMIN_PHONE = "+998903389888"
 DEFAULT_ADMIN_PASSWORD = "avtoservis"
+# Avvalgi standart admin raqami: agar bazada shu raqamli admin bo'lsa, u yangi
+# raqamga ko'chiriladi (parol, ID va tarix saqlanadi, ikkinchi admin yaratilmaydi).
+OLD_DEFAULT_ADMIN_PHONE = "+998901234567"
 
 def bootstrap_admin():
     db = SessionLocal()
     try:
         existing = db.query(User).filter(User.phone == DEFAULT_ADMIN_PHONE).first()
+        if not existing:
+            old = db.query(User).filter(
+                User.phone == OLD_DEFAULT_ADMIN_PHONE,
+                User.role == UserRole.ADMIN.value,
+            ).first()
+            if old:
+                old.phone = DEFAULT_ADMIN_PHONE
+                db.commit()
+                logging.getLogger("uvicorn.error").warning(
+                    f"[bootstrap] admin phone changed: {OLD_DEFAULT_ADMIN_PHONE} -> {DEFAULT_ADMIN_PHONE}"
+                )
+                existing = old
         if existing:
             # Make sure it stays an admin even if something else changed it.
             if existing.role != UserRole.ADMIN.value:
