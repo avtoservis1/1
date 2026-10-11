@@ -3885,6 +3885,11 @@ def create_order(user_id: int, order: OrderCreate, db: Session = Depends(get_db)
     if not user:
         raise HTTPException(status_code=404, detail="Foydalanuvchi topilmadi")
 
+    # Buyurtma berish uchun mijozda kamida bitta mashina bo'lishi shart
+    # (ro'yxatdan o'tishda mashina so'ralmaydi - uni ilova ichida keyin qo'shadi).
+    if user.role == UserRole.USER.value and db.query(Car.id).filter(Car.user_id == user.id).first() is None:
+        raise HTTPException(status_code=400, detail="Buyurtma berish uchun avval mashinangizni qo'shing")
+
     service = db.query(Service).filter(Service.id == order.service_id).first()
     if not service:
         raise HTTPException(status_code=404, detail="Servis topilmadi")
